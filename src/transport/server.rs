@@ -1,0 +1,583 @@
+//! Server-side Nostr transport for ContextVM.
+//!
+//! Listens for incoming MCP requests from clients over Nostr, manages multi-client
+//! sessions, handles request/response correlation, and optionally publishes
+//! server announcements.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use nostr_sdk::prelude::*;
+use tokio::sync::RwLock;
+
+use crate::core::constants::*;
+use crate::core::error::{Error, Result};
+use crate::core::serializers;
+use crate::core::types::*;
+use crate::encryption;
+use crate::relay::RelayPool;
+use crate::transport::base::BaseTransport;
+
+/// Configuration for the server transport.
+pub struct NostrServerTransportConfig {
+    /// Relay URLs to connect to.
+    pub relay_urls: Vec<String>,
+    /// Encryption mode.
+    pub encryption_mode: EncryptionMode,
+    /// Server information for announcements.
+    pub server_info: Option<ServerInfo>,
+    /// Whether this is a public server (publishes announcements).
+    pub is_public_server: bool,
+    /// Allowed client public keys (hex). Empty = allow all.
+    pub allowed_public_keys: Vec<String>,
+    /// Capabilities excluded from pubkey whitelisting.
+    pub excluded_capabilities: Vec<CapabilityExclusion>,
+    /// Session cleanup interval (default: 60s).
+    pub cleanup_interval: Duration,
+    /// Session timeout (default: 300s).
+    pub session_timeout: Duration,
+}
+
+impl Default for NostrServerTransportConfig {
+    fn default() -> Self {
+        Self {
+            relay_urls: vec!["wss://relay.damus.io".to_string()],
+            encryption_mode: EncryptionMode::Optional,
+            server_info: None,
+            is_public_server: false,
+            allowed_public_keys: Vec::new(),
+            excluded_capabilities: Vec::new(),
+            cleanup_interval: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+/// Server-side Nostr transport — receives MCP requests and sends responses.
+pub struct NostrServerTransport {
+    base: BaseTransport,
+    config: NostrServerTransportConfig,
+    /// Client sessions: client_pubkey_hex → ClientSession
+    sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
+    /// Reverse lookup: event_id → client_pubkey_hex
+    event_to_client: Arc<RwLock<HashMap<String, String>>>,
+    /// Channel for incoming MCP messages (consumed by the MCP server).
+    message_tx: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
+    message_rx: Option<tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>>,
+}
+
+/// An incoming MCP request with metadata for routing the response.
+#[derive(Debug)]
+pub struct IncomingRequest {
+    /// The parsed MCP message.
+    pub message: JsonRpcMessage,
+    /// The client's public key (hex).
+    pub client_pubkey: String,
+    /// The Nostr event ID (for response correlation).
+    pub event_id: String,
+    /// Whether the original message was encrypted.
+    pub is_encrypted: bool,
+}
+
+impl NostrServerTransport {
+    /// Create a new server transport.
+    pub async fn new<T>(signer: T, config: NostrServerTransportConfig) -> Result<Self>
+    where
+        T: IntoNostrSigner,
+    {
+        let relay_pool = Arc::new(RelayPool::new(signer).await?);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        Ok(Self {
+            base: BaseTransport {
+                relay_pool,
+                encryption_mode: config.encryption_mode,
+                is_connected: false,
+            },
+            config,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            event_to_client: Arc::new(RwLock::new(HashMap::new())),
+            message_tx: tx,
+            message_rx: Some(rx),
+        })
+    }
+
+    /// Start listening for incoming requests.
+    pub async fn start(&mut self) -> Result<()> {
+        self.base.connect(&self.config.relay_urls).await?;
+
+        let pubkey = self.base.get_public_key().await?;
+        tracing::info!(pubkey = %pubkey.to_hex(), "Server transport started");
+
+        self.base.subscribe_for_pubkey(&pubkey).await?;
+
+        // Spawn event loop
+        let client = self.base.relay_pool.client().clone();
+        let sessions = self.sessions.clone();
+        let event_to_client = self.event_to_client.clone();
+        let tx = self.message_tx.clone();
+        let allowed = self.config.allowed_public_keys.clone();
+        let excluded = self.config.excluded_capabilities.clone();
+        let encryption_mode = self.config.encryption_mode;
+
+        tokio::spawn(async move {
+            Self::event_loop(client, sessions, event_to_client, tx, allowed, excluded, encryption_mode).await;
+        });
+
+        // Spawn session cleanup
+        let sessions_cleanup = self.sessions.clone();
+        let event_to_client_cleanup = self.event_to_client.clone();
+        let cleanup_interval = self.config.cleanup_interval;
+        let session_timeout = self.config.session_timeout;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(cleanup_interval);
+            loop {
+                interval.tick().await;
+                let cleaned = Self::cleanup_sessions(
+                    &sessions_cleanup,
+                    &event_to_client_cleanup,
+                    session_timeout,
+                )
+                .await;
+                if cleaned > 0 {
+                    tracing::info!(cleaned, "Cleaned up inactive sessions");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Close the transport.
+    pub async fn close(&mut self) -> Result<()> {
+        self.base.disconnect().await?;
+        self.sessions.write().await.clear();
+        self.event_to_client.write().await.clear();
+        Ok(())
+    }
+
+    /// Send a response back to the client that sent the original request.
+    pub async fn send_response(
+        &self,
+        event_id: &str,
+        mut response: JsonRpcMessage,
+    ) -> Result<()> {
+        let event_to_client = self.event_to_client.read().await;
+        let client_pubkey_hex = event_to_client
+            .get(event_id)
+            .ok_or_else(|| Error::Other(format!("No client found for event {event_id}")))?
+            .clone();
+        drop(event_to_client);
+
+        let sessions = self.sessions.read().await;
+        let session = sessions
+            .get(&client_pubkey_hex)
+            .ok_or_else(|| Error::Other(format!("No session for client {client_pubkey_hex}")))?;
+
+        // Restore original request ID
+        if let Some(original_id) = session.pending_requests.get(event_id) {
+            match &mut response {
+                JsonRpcMessage::Response(r) => r.id = original_id.clone(),
+                JsonRpcMessage::ErrorResponse(r) => r.id = original_id.clone(),
+                _ => {}
+            }
+        }
+
+        let is_encrypted = session.is_encrypted;
+        drop(sessions);
+
+        let client_pubkey = PublicKey::from_hex(&client_pubkey_hex)
+            .map_err(|e| Error::Other(e.to_string()))?;
+
+        let event_id_parsed =
+            EventId::from_hex(event_id).map_err(|e| Error::Other(e.to_string()))?;
+
+        let tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
+
+        self.base
+            .send_mcp_message(
+                &response,
+                &client_pubkey,
+                CTXVM_MESSAGES_KIND,
+                tags,
+                Some(is_encrypted),
+            )
+            .await?;
+
+        // Clean up
+        let mut sessions = self.sessions.write().await;
+        if let Some(session) = sessions.get_mut(&client_pubkey_hex) {
+            // Clean up progress token
+            if let Some(token) = session.event_to_progress_token.remove(event_id) {
+                session.pending_requests.remove(&token);
+            }
+            session.pending_requests.remove(event_id);
+        }
+        drop(sessions);
+
+        self.event_to_client.write().await.remove(event_id);
+
+        Ok(())
+    }
+
+    /// Send a notification to a specific client.
+    pub async fn send_notification(
+        &self,
+        client_pubkey_hex: &str,
+        notification: &JsonRpcMessage,
+        correlated_event_id: Option<&str>,
+    ) -> Result<()> {
+        let sessions = self.sessions.read().await;
+        let session = sessions
+            .get(client_pubkey_hex)
+            .ok_or_else(|| Error::Other(format!("No session for {client_pubkey_hex}")))?;
+        let is_encrypted = session.is_encrypted;
+        drop(sessions);
+
+        let client_pubkey = PublicKey::from_hex(client_pubkey_hex)
+            .map_err(|e| Error::Other(e.to_string()))?;
+
+        let mut tags = BaseTransport::create_recipient_tags(&client_pubkey);
+        if let Some(eid) = correlated_event_id {
+            let event_id = EventId::from_hex(eid).map_err(|e| Error::Other(e.to_string()))?;
+            tags.push(Tag::event(event_id));
+        }
+
+        self.base
+            .send_mcp_message(
+                notification,
+                &client_pubkey,
+                CTXVM_MESSAGES_KIND,
+                tags,
+                Some(is_encrypted),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Broadcast a notification to all initialized clients.
+    pub async fn broadcast_notification(&self, notification: &JsonRpcMessage) -> Result<()> {
+        let sessions = self.sessions.read().await;
+        let initialized: Vec<String> = sessions
+            .iter()
+            .filter(|(_, s)| s.is_initialized)
+            .map(|(k, _)| k.clone())
+            .collect();
+        drop(sessions);
+
+        for pubkey in initialized {
+            if let Err(e) = self.send_notification(&pubkey, notification, None).await {
+                tracing::error!(client = %pubkey, "Failed to send notification: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the message receiver for consuming incoming requests.
+    pub fn take_message_receiver(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>> {
+        self.message_rx.take()
+    }
+
+    /// Publish server announcement (kind 11316).
+    pub async fn announce(&self) -> Result<EventId> {
+        let info = self
+            .config
+            .server_info
+            .as_ref()
+            .ok_or_else(|| Error::Other("No server info configured".to_string()))?;
+
+        let content = serde_json::to_string(info)?;
+
+        let mut tags = Vec::new();
+        if let Some(ref name) = info.name {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::NAME.into()),
+                vec![name.clone()],
+            ));
+        }
+        if let Some(ref about) = info.about {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::ABOUT.into()),
+                vec![about.clone()],
+            ));
+        }
+        if let Some(ref website) = info.website {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::WEBSITE.into()),
+                vec![website.clone()],
+            ));
+        }
+        if let Some(ref picture) = info.picture {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::PICTURE.into()),
+                vec![picture.clone()],
+            ));
+        }
+        if self.config.encryption_mode != EncryptionMode::Disabled {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::SUPPORT_ENCRYPTION.into()),
+                Vec::<String>::new(),
+            ));
+        }
+
+        let builder =
+            EventBuilder::new(Kind::Custom(SERVER_ANNOUNCEMENT_KIND), content).tags(tags);
+
+        self.base.relay_pool.publish(builder).await
+    }
+
+    /// Publish tools list (kind 11317).
+    pub async fn publish_tools(&self, tools: Vec<serde_json::Value>) -> Result<EventId> {
+        let content = serde_json::json!({ "tools": tools });
+        let builder = EventBuilder::new(
+            Kind::Custom(TOOLS_LIST_KIND),
+            serde_json::to_string(&content)?,
+        );
+        self.base.relay_pool.publish(builder).await
+    }
+
+    /// Publish resources list (kind 11318).
+    pub async fn publish_resources(&self, resources: Vec<serde_json::Value>) -> Result<EventId> {
+        let content = serde_json::json!({ "resources": resources });
+        let builder = EventBuilder::new(
+            Kind::Custom(RESOURCES_LIST_KIND),
+            serde_json::to_string(&content)?,
+        );
+        self.base.relay_pool.publish(builder).await
+    }
+
+    /// Publish prompts list (kind 11320).
+    pub async fn publish_prompts(&self, prompts: Vec<serde_json::Value>) -> Result<EventId> {
+        let content = serde_json::json!({ "prompts": prompts });
+        let builder = EventBuilder::new(
+            Kind::Custom(PROMPTS_LIST_KIND),
+            serde_json::to_string(&content)?,
+        );
+        self.base.relay_pool.publish(builder).await
+    }
+
+    /// Publish resource templates list (kind 11319).
+    pub async fn publish_resource_templates(
+        &self,
+        templates: Vec<serde_json::Value>,
+    ) -> Result<EventId> {
+        let content = serde_json::json!({ "resourceTemplates": templates });
+        let builder = EventBuilder::new(
+            Kind::Custom(RESOURCETEMPLATES_LIST_KIND),
+            serde_json::to_string(&content)?,
+        );
+        self.base.relay_pool.publish(builder).await
+    }
+
+    /// Delete server announcements (NIP-09 kind 5).
+    pub async fn delete_announcements(&self, reason: &str) -> Result<()> {
+        // We publish kind 5 events for each announcement kind
+        let pubkey = self.base.get_public_key().await?;
+        let _pubkey_hex = pubkey.to_hex();
+
+        for kind in UNENCRYPTED_KINDS {
+            let builder = EventBuilder::new(Kind::Custom(5), reason)
+                .tag(Tag::custom(
+                    TagKind::Custom("k".into()),
+                    vec![kind.to_string()],
+                ));
+            self.base.relay_pool.publish(builder).await?;
+        }
+        Ok(())
+    }
+
+    // ── Internal ────────────────────────────────────────────────
+
+    fn is_capability_excluded(
+        excluded: &[CapabilityExclusion],
+        method: &str,
+        name: Option<&str>,
+    ) -> bool {
+        // Always allow fundamental MCP methods
+        if method == "initialize" || method == "notifications/initialized" {
+            return true;
+        }
+
+        excluded.iter().any(|excl| {
+            if excl.method != method {
+                return false;
+            }
+            match (&excl.name, name) {
+                (Some(excl_name), Some(req_name)) => excl_name == req_name,
+                (None, _) => true, // method-only match
+                _ => false,
+            }
+        })
+    }
+
+    async fn event_loop(
+        client: Arc<Client>,
+        sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
+        event_to_client: Arc<RwLock<HashMap<String, String>>>,
+        tx: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
+        allowed_pubkeys: Vec<String>,
+        excluded_capabilities: Vec<CapabilityExclusion>,
+        encryption_mode: EncryptionMode,
+    ) {
+        let mut notifications = client.notifications();
+
+        while let Ok(notification) = notifications.recv().await {
+            if let RelayPoolNotification::Event { event, .. } = notification {
+                let (content, sender_pubkey, event_id, is_encrypted) =
+                    if event.kind == Kind::Custom(GIFT_WRAP_KIND) {
+                        if encryption_mode == EncryptionMode::Disabled {
+                            tracing::warn!("Received encrypted message but encryption is disabled");
+                            continue;
+                        }
+                        match encryption::decrypt_gift_wrap(&client, &event).await {
+                            Ok(rumor) => (
+                                rumor.content,
+                                rumor.pubkey.to_hex(),
+                                event.id.to_hex(),
+                                true,
+                            ),
+                            Err(e) => {
+                                tracing::error!("Failed to decrypt: {e}");
+                                continue;
+                            }
+                        }
+                    } else {
+                        if encryption_mode == EncryptionMode::Required {
+                            tracing::warn!(
+                                pubkey = %event.pubkey,
+                                "Received unencrypted message but encryption is required"
+                            );
+                            continue;
+                        }
+                        (
+                            event.content.clone(),
+                            event.pubkey.to_hex(),
+                            event.id.to_hex(),
+                            false,
+                        )
+                    };
+
+                // Parse MCP message
+                let mcp_msg = match serializers::nostr_event_to_mcp_message(&content) {
+                    Some(msg) => msg,
+                    None => {
+                        tracing::warn!("Invalid MCP message from {sender_pubkey}");
+                        continue;
+                    }
+                };
+
+                // Authorization check
+                if !allowed_pubkeys.is_empty() {
+                    let method = mcp_msg.method().unwrap_or("");
+                    let name = match &mcp_msg {
+                        JsonRpcMessage::Request(r) => r
+                            .params
+                            .as_ref()
+                            .and_then(|p| p.get("name"))
+                            .and_then(|n| n.as_str()),
+                        _ => None,
+                    };
+
+                    let is_excluded =
+                        Self::is_capability_excluded(&excluded_capabilities, method, name);
+
+                    if !allowed_pubkeys.contains(&sender_pubkey) && !is_excluded {
+                        tracing::warn!(
+                            pubkey = %sender_pubkey,
+                            method = %method,
+                            "Unauthorized request"
+                        );
+                        continue;
+                    }
+                }
+
+                // Session management
+                let mut sessions_w = sessions.write().await;
+                let session = sessions_w
+                    .entry(sender_pubkey.clone())
+                    .or_insert_with(|| ClientSession::new(is_encrypted));
+                session.update_activity();
+                session.is_encrypted = is_encrypted;
+
+                // Track request for correlation
+                if let JsonRpcMessage::Request(ref req) = mcp_msg {
+                    let original_id = req.id.clone();
+                    session
+                        .pending_requests
+                        .insert(event_id.clone(), original_id);
+                    event_to_client
+                        .write()
+                        .await
+                        .insert(event_id.clone(), sender_pubkey.clone());
+
+                    // Track progress token
+                    if let Some(token) = req
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("_meta"))
+                        .and_then(|m| m.get("progressToken"))
+                        .and_then(|t| t.as_str())
+                    {
+                        session
+                            .pending_requests
+                            .insert(token.to_string(), serde_json::json!(event_id));
+                        session
+                            .event_to_progress_token
+                            .insert(event_id.clone(), token.to_string());
+                    }
+                }
+
+                // Handle initialized notification
+                if let JsonRpcMessage::Notification(ref n) = mcp_msg {
+                    if n.method == "notifications/initialized" {
+                        session.is_initialized = true;
+                    }
+                }
+
+                drop(sessions_w);
+
+                // Forward to consumer
+                let _ = tx.send(IncomingRequest {
+                    message: mcp_msg,
+                    client_pubkey: sender_pubkey,
+                    event_id,
+                    is_encrypted,
+                });
+            }
+        }
+    }
+
+    async fn cleanup_sessions(
+        sessions: &RwLock<HashMap<String, ClientSession>>,
+        event_to_client: &RwLock<HashMap<String, String>>,
+        timeout: Duration,
+    ) -> usize {
+        let mut sessions_w = sessions.write().await;
+        let mut event_map = event_to_client.write().await;
+        let mut cleaned = 0;
+
+        sessions_w.retain(|pubkey, session| {
+            if session.last_activity.elapsed() > timeout {
+                // Clean up reverse mappings
+                for event_id in session.pending_requests.keys() {
+                    event_map.remove(event_id);
+                }
+                for event_id in session.event_to_progress_token.keys() {
+                    event_map.remove(event_id);
+                }
+                tracing::debug!(client = %pubkey, "Session expired");
+                cleaned += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        cleaned
+    }
+}

@@ -1,0 +1,64 @@
+//! Message validation utilities.
+
+use crate::core::constants::MAX_MESSAGE_SIZE;
+use crate::core::types::JsonRpcMessage;
+
+/// Validate that a message's content doesn't exceed the maximum size (1MB).
+pub fn validate_message_size(content: &str) -> bool {
+    content.len() <= MAX_MESSAGE_SIZE
+}
+
+/// Validate that a JSON value is a well-formed JSON-RPC 2.0 message.
+///
+/// Checks:
+/// - Has `jsonrpc: "2.0"`
+/// - Is one of: request (id + method), response (id + result), error (id + error), notification (method, no id)
+pub fn validate_message(value: &serde_json::Value) -> Option<JsonRpcMessage> {
+    // Must have jsonrpc field
+    let jsonrpc = value.get("jsonrpc")?.as_str()?;
+    if jsonrpc != "2.0" {
+        return None;
+    }
+
+    serde_json::from_value(value.clone()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_valid_request() {
+        let msg = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let parsed = validate_message(&msg).unwrap();
+        assert!(parsed.is_request());
+    }
+
+    #[test]
+    fn test_valid_notification() {
+        let msg = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        let parsed = validate_message(&msg).unwrap();
+        assert!(parsed.is_notification());
+    }
+
+    #[test]
+    fn test_valid_response() {
+        let msg = json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}});
+        let parsed = validate_message(&msg).unwrap();
+        assert!(parsed.is_response());
+    }
+
+    #[test]
+    fn test_invalid_version() {
+        let msg = json!({"jsonrpc": "1.0", "id": 1, "method": "test"});
+        assert!(validate_message(&msg).is_none());
+    }
+
+    #[test]
+    fn test_size_validation() {
+        assert!(validate_message_size("hello"));
+        let big = "x".repeat(MAX_MESSAGE_SIZE + 1);
+        assert!(!validate_message_size(&big));
+    }
+}
