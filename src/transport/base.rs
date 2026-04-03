@@ -101,7 +101,8 @@ impl BaseTransport {
 
     /// Send an MCP message to a recipient, optionally encrypting.
     ///
-    /// Returns the event ID of the published event.
+    /// Returns the signed MCP event ID.
+    /// When encrypted, this is the inner signed event ID.
     pub async fn send_mcp_message(
         &self,
         message: &JsonRpcMessage,
@@ -113,6 +114,7 @@ impl BaseTransport {
         let should_encrypt = self.should_encrypt(kind, is_encrypted);
 
         let event = self.create_signed_event(message, kind, tags).await?;
+        let signed_event_id = event.id;
 
         if should_encrypt {
             // Single-layer gift wrap: JSON.stringify(signedEvent) → NIP-44 encrypt
@@ -124,14 +126,18 @@ impl BaseTransport {
             let gift_wrap_event = encryption::gift_wrap_single_layer(
                 &signer, recipient, &event_json,
             ).await?;
-            let event_id = self.relay_pool.publish_event(&gift_wrap_event).await?;
-            tracing::debug!(event_id = %event_id, "Sent encrypted MCP message");
-            Ok(event_id)
+            self.relay_pool.publish_event(&gift_wrap_event).await?;
+            tracing::debug!(
+                signed_event_id = %signed_event_id,
+                envelope_id = %gift_wrap_event.id,
+                "Sent encrypted MCP message"
+            );
         } else {
-            let event_id = self.relay_pool.publish_event(&event).await?;
-            tracing::debug!(event_id = %event_id, "Sent unencrypted MCP message");
-            Ok(event_id)
+            self.relay_pool.publish_event(&event).await?;
+            tracing::debug!(signed_event_id = %signed_event_id, "Sent unencrypted MCP message");
         }
+
+        Ok(signed_event_id)
     }
 
     /// Determine whether a message should be encrypted.
