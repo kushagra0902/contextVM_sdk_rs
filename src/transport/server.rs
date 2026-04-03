@@ -395,6 +395,55 @@ impl NostrServerTransport {
         Ok(())
     }
 
+    /// Publish tools list from rmcp typed tool descriptors.
+    #[cfg(feature = "rmcp")]
+    pub async fn publish_tools_typed(&self, tools: Vec<rmcp::model::Tool>) -> Result<EventId> {
+        let tools = tools
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.publish_tools(tools).await
+    }
+
+    /// Publish resources list from rmcp typed resource descriptors.
+    #[cfg(feature = "rmcp")]
+    pub async fn publish_resources_typed(
+        &self,
+        resources: Vec<rmcp::model::Resource>,
+    ) -> Result<EventId> {
+        let resources = resources
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.publish_resources(resources).await
+    }
+
+    /// Publish prompts list from rmcp typed prompt descriptors.
+    #[cfg(feature = "rmcp")]
+    pub async fn publish_prompts_typed(
+        &self,
+        prompts: Vec<rmcp::model::Prompt>,
+    ) -> Result<EventId> {
+        let prompts = prompts
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.publish_prompts(prompts).await
+    }
+
+    /// Publish resource templates list from rmcp typed template descriptors.
+    #[cfg(feature = "rmcp")]
+    pub async fn publish_resource_templates_typed(
+        &self,
+        templates: Vec<rmcp::model::ResourceTemplate>,
+    ) -> Result<EventId> {
+        let templates = templates
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.publish_resource_templates(templates).await
+    }
+
     // ── Internal ────────────────────────────────────────────────
 
     fn is_capability_excluded(

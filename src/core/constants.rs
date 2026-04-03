@@ -69,6 +69,12 @@ pub mod tags {
 /// Maximum message size (1MB)
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 
+/// MCP protocol version string used in initialize responses.
+///
+/// Matches the `protocolVersion` field of the `InitializeResult` JSON-RPC response.
+/// Keep this in sync with the MCP spec and rmcp's `ProtocolVersion::LATEST`.
+pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+
 /// Default LRU cache size for deduplication
 pub const DEFAULT_LRU_SIZE: usize = 5000;
 

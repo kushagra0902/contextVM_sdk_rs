@@ -17,7 +17,7 @@ use crate::core::types::*;
 use crate::encryption;
 use crate::relay::RelayPool;
 use crate::transport::base::BaseTransport;
-use rmcp::model::ProtocolVersion;
+
 
 /// Configuration for the client transport.
 pub struct NostrClientTransportConfig {
@@ -134,10 +134,12 @@ impl NostrClientTransport {
             .send_mcp_message(message, &self.server_pubkey, CTXVM_MESSAGES_KIND, tags, None)
             .await?;
 
-        self.pending_requests
-            .write()
-            .await
-            .insert(event_id.to_hex());
+        if matches!(message, JsonRpcMessage::Request(_)) {
+            self.pending_requests
+                .write()
+                .await
+                .insert(event_id.to_hex());
+        }
 
         Ok(())
     }
@@ -154,7 +156,7 @@ impl NostrClientTransport {
             jsonrpc: "2.0".to_string(),
             id: request_id.clone(),
             result: serde_json::json!({
-                "protocolVersion": ProtocolVersion::LATEST.to_string(),
+                "protocolVersion": crate::core::constants::MCP_PROTOCOL_VERSION,
                 "serverInfo": {
                     "name": "Emulated-Stateless-Server",
                     "version": "1.0.0"
@@ -277,7 +279,7 @@ mod tests {
             jsonrpc: "2.0".to_string(),
             id: request_id.clone(),
             result: serde_json::json!({
-                "protocolVersion": ProtocolVersion::LATEST.to_string(),
+                "protocolVersion": crate::core::constants::MCP_PROTOCOL_VERSION,
                 "serverInfo": {
                     "name": "Emulated-Stateless-Server",
                     "version": "1.0.0"

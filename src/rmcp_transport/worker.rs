@@ -3,6 +3,8 @@
 //! This file defines wrapper types that bind existing ContextVM Nostr
 //! transports to rmcp's worker abstraction.
 
+use std::collections::HashMap;
+
 use crate::core::error::Result;
 use crate::core::types::JsonRpcMessage;
 use crate::transport::client::{NostrClientTransport, NostrClientTransportConfig};
@@ -17,6 +19,10 @@ use super::convert::{
 /// rmcp server worker wrapper for ContextVM Nostr server transport.
 pub struct NostrServerWorker {
 	transport: NostrServerTransport,
+	// rmcp service instance is single-peer. Keep one active client per worker.
+	active_client_pubkey: Option<String>,
+	// Maps request id (serialized JSON value) -> incoming Nostr event id.
+	request_id_to_event_id: HashMap<String, String>,
 }
 
 impl NostrServerWorker {
@@ -26,7 +32,11 @@ impl NostrServerWorker {
 		T: nostr_sdk::prelude::IntoNostrSigner,
 	{
 		let transport = NostrServerTransport::new(signer, config).await?;
-		Ok(Self { transport })
+		Ok(Self {
+			transport,
+			active_client_pubkey: None,
+			request_id_to_event_id: HashMap::new(),
+		})
 	}
 
 	/// Access the wrapped transport.
@@ -71,16 +81,45 @@ impl Worker for NostrServerWorker {
 					break WorkerQuitReason::Cancelled;
 				}
 				incoming = rx.recv() => {
-					let Some(mut incoming) = incoming else {
+					let Some(incoming) = incoming else {
 						break WorkerQuitReason::TransportClosed;
 					};
 
-					// Use event_id as internal request id to keep response routing deterministic.
-					if let JsonRpcMessage::Request(ref mut req) = incoming.message {
-						req.id = serde_json::json!(incoming.event_id.clone());
+					let crate::transport::server::IncomingRequest {
+						message,
+						client_pubkey,
+						event_id,
+						..
+					} = incoming;
+
+					match &self.active_client_pubkey {
+						Some(active) if active != &client_pubkey => {
+							tracing::warn!(
+								active_client = %active,
+								ignored_client = %client_pubkey,
+								"Ignoring message from second client: rmcp server worker currently supports one active client per worker"
+							);
+							continue;
+						}
+						None => {
+							tracing::info!(client_pubkey = %client_pubkey, "Binding rmcp server worker to first client session");
+							self.active_client_pubkey = Some(client_pubkey.clone());
+						}
+						_ => {}
 					}
 
-					if let Some(rmcp_msg) = internal_to_rmcp_server_rx(&incoming.message) {
+					if let JsonRpcMessage::Request(req) = &message {
+						match serde_json::to_string(&req.id) {
+							Ok(request_key) => {
+								self.request_id_to_event_id.insert(request_key, event_id);
+							}
+							Err(e) => {
+								tracing::warn!("Failed to serialize request id for correlation map: {e}");
+							}
+						}
+					}
+
+					if let Some(rmcp_msg) = internal_to_rmcp_server_rx(&message) {
 						if let Err(reason) = context.send_to_handler(rmcp_msg).await {
 							break reason;
 						}
@@ -212,35 +251,71 @@ impl Worker for NostrClientWorker {
 }
 
 impl NostrServerWorker {
-	async fn forward_server_internal(&self, message: JsonRpcMessage) -> Result<()> {
+	async fn forward_server_internal(&mut self, message: JsonRpcMessage) -> Result<()> {
 		match message {
 			JsonRpcMessage::Response(resp) => {
-				let event_id = resp.id.as_str().map(str::to_owned).ok_or_else(|| {
-					crate::core::error::Error::Validation(
-						"rmcp server response id must be a string event id".to_string(),
-					)
+				let request_key = serde_json::to_string(&resp.id).map_err(|e| {
+					crate::core::error::Error::Validation(format!(
+						"failed to serialize rmcp response id for correlation lookup: {e}"
+					))
 				})?;
+
+				let event_id = if let Some(event_id) = self.request_id_to_event_id.remove(&request_key) {
+					event_id
+				} else {
+					resp.id.as_str().map(str::to_owned).ok_or_else(|| {
+						crate::core::error::Error::Validation(
+							"rmcp server response id has no known correlation mapping and is not a string event id"
+								.to_string(),
+						)
+					})?
+				};
+
 				self.transport
 					.send_response(&event_id, JsonRpcMessage::Response(resp))
 					.await
 			}
 			JsonRpcMessage::ErrorResponse(resp) => {
-				let event_id = resp.id.as_str().map(str::to_owned).ok_or_else(|| {
-					crate::core::error::Error::Validation(
-						"rmcp server error response id must be a string event id".to_string(),
-					)
+				let request_key = serde_json::to_string(&resp.id).map_err(|e| {
+					crate::core::error::Error::Validation(format!(
+						"failed to serialize rmcp error response id for correlation lookup: {e}"
+					))
 				})?;
+
+				let event_id = if let Some(event_id) = self.request_id_to_event_id.remove(&request_key) {
+					event_id
+				} else {
+					resp.id.as_str().map(str::to_owned).ok_or_else(|| {
+						crate::core::error::Error::Validation(
+							"rmcp server error response id has no known correlation mapping and is not a string event id"
+								.to_string(),
+						)
+					})?
+				};
+
 				self.transport
 					.send_response(&event_id, JsonRpcMessage::ErrorResponse(resp))
 					.await
 			}
 			JsonRpcMessage::Notification(notification) => {
+				let target = self.active_client_pubkey.as_deref().ok_or_else(|| {
+					crate::core::error::Error::Validation(
+						"cannot forward rmcp server notification: no active client bound"
+							.to_string(),
+					)
+				})?;
 				let message = JsonRpcMessage::Notification(notification);
-				self.transport.broadcast_notification(&message).await
+				self.transport.send_notification(target, &message, None).await
 			}
-			JsonRpcMessage::Request(_) => Err(crate::core::error::Error::Validation(
-				"rmcp server worker cannot forward outbound request messages".to_string(),
-			)),
+			JsonRpcMessage::Request(request) => {
+				let target = self.active_client_pubkey.as_deref().ok_or_else(|| {
+					crate::core::error::Error::Validation(
+						"cannot forward rmcp server request: no active client bound".to_string(),
+					)
+				})?;
+				let message = JsonRpcMessage::Request(request);
+				self.transport.send_notification(target, &message, None).await
+			}
 		}
 	}
 }
