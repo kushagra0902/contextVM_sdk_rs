@@ -18,7 +18,6 @@ use crate::encryption;
 use crate::relay::RelayPool;
 use crate::transport::base::BaseTransport;
 
-
 /// Configuration for the client transport.
 pub struct NostrClientTransportConfig {
     /// Relay URLs to connect to.
@@ -131,7 +130,13 @@ impl NostrClientTransport {
         let tags = BaseTransport::create_recipient_tags(&self.server_pubkey);
         let event_id = self
             .base
-            .send_mcp_message(message, &self.server_pubkey, CTXVM_MESSAGES_KIND, tags, None)
+            .send_mcp_message(
+                message,
+                &self.server_pubkey,
+                CTXVM_MESSAGES_KIND,
+                tags,
+                None,
+            )
             .await?;
 
         if matches!(message, JsonRpcMessage::Request(_)) {
@@ -183,40 +188,40 @@ impl NostrClientTransport {
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
                 // Handle gift-wrapped events
-                let (actual_event_content, actual_pubkey, e_tag) =
-                    if event.kind == Kind::Custom(GIFT_WRAP_KIND)
-                        || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
-                    {
-                        // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                        let signer = match client.signer().await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::error!("Failed to get signer: {e}");
-                                continue;
-                            }
-                        };
-                        match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
-                            Ok(decrypted_json) => {
-                                match serde_json::from_str::<Event>(&decrypted_json) {
-                                    Ok(inner) => {
-                                        let e_tag = serializers::get_tag_value(&inner.tags, "e");
-                                        (inner.content, inner.pubkey, e_tag)
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Failed to parse inner event: {e}");
-                                        continue;
-                                    }
+                let (actual_event_content, actual_pubkey, e_tag) = if event.kind
+                    == Kind::Custom(GIFT_WRAP_KIND)
+                    || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
+                {
+                    // Single-layer NIP-44 decrypt (matches JS/TS SDK)
+                    let signer = match client.signer().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("Failed to get signer: {e}");
+                            continue;
+                        }
+                    };
+                    match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
+                        Ok(decrypted_json) => {
+                            match serde_json::from_str::<Event>(&decrypted_json) {
+                                Ok(inner) => {
+                                    let e_tag = serializers::get_tag_value(&inner.tags, "e");
+                                    (inner.content, inner.pubkey, e_tag)
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to parse inner event: {e}");
+                                    continue;
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("Failed to decrypt gift wrap: {e}");
-                                continue;
-                            }
                         }
-                    } else {
-                        let e_tag = serializers::get_tag_value(&event.tags, "e");
-                        (event.content.clone(), event.pubkey, e_tag)
-                    };
+                        Err(e) => {
+                            tracing::error!("Failed to decrypt gift wrap: {e}");
+                            continue;
+                        }
+                    }
+                } else {
+                    let e_tag = serializers::get_tag_value(&event.tags, "e");
+                    (event.content.clone(), event.pubkey, e_tag)
+                };
 
                 // Verify it's from our server
                 if actual_pubkey != server_pubkey {
@@ -298,7 +303,10 @@ mod tests {
             assert!(r.result.get("capabilities").is_some());
             assert!(r.result.get("serverInfo").is_some());
             let server_info = r.result.get("serverInfo").unwrap();
-            assert_eq!(server_info.get("name").unwrap().as_str().unwrap(), "Emulated-Stateless-Server");
+            assert_eq!(
+                server_info.get("name").unwrap().as_str().unwrap(),
+                "Emulated-Stateless-Server"
+            );
         }
     }
 

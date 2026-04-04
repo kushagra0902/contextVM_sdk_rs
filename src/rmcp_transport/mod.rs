@@ -9,7 +9,7 @@ pub mod worker;
 mod pipeline_tests;
 
 pub use convert::{
-	internal_to_rmcp_client_rx, internal_to_rmcp_server_rx, rmcp_client_tx_to_internal,
-	rmcp_server_tx_to_internal,
+    internal_to_rmcp_client_rx, internal_to_rmcp_server_rx, rmcp_client_tx_to_internal,
+    rmcp_server_tx_to_internal,
 };
 pub use worker::{NostrClientWorker, NostrServerWorker};

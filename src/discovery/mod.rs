@@ -64,8 +64,7 @@ pub async fn discover_servers(
 
     let mut announcements = Vec::new();
     for event in events {
-        let server_info: ServerInfo =
-            serde_json::from_str(&event.content).unwrap_or_default();
+        let server_info: ServerInfo = serde_json::from_str(&event.content).unwrap_or_default();
         announcements.push(ServerAnnouncement {
             pubkey: event.pubkey.to_hex(),
             pubkey_parsed: event.pubkey,
@@ -233,7 +232,10 @@ mod tests {
         assert_eq!(parsed.version, Some("1.0.0".to_string()));
         assert_eq!(parsed.about, Some("A test MCP server".to_string()));
         assert_eq!(parsed.website, Some("https://example.com".to_string()));
-        assert_eq!(parsed.picture, Some("https://example.com/pic.png".to_string()));
+        assert_eq!(
+            parsed.picture,
+            Some("https://example.com/pic.png".to_string())
+        );
     }
 
     #[test]
@@ -280,7 +282,8 @@ mod tests {
             },
             event_id: EventId::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000001",
-            ).unwrap(),
+            )
+            .unwrap(),
             created_at: Timestamp::now(),
         };
 

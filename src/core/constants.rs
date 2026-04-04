@@ -217,4 +217,3 @@ mod tests {
         assert!(!UNENCRYPTED_KINDS.contains(&EPHEMERAL_GIFT_WRAP_KIND));
     }
 }
-

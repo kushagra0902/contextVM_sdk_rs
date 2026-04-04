@@ -127,13 +127,16 @@ impl BaseTransport {
         if should_encrypt {
             // Single-layer gift wrap: JSON.stringify(signedEvent) → NIP-44 encrypt
             // This matches the JS/TS SDK's encryptMessage(JSON.stringify(event), recipient)
-            let event_json = serde_json::to_string(&event)
+            let event_json =
+                serde_json::to_string(&event).map_err(|e| Error::Encryption(e.to_string()))?;
+            let signer = self
+                .relay_pool
+                .client()
+                .signer()
+                .await
                 .map_err(|e| Error::Encryption(e.to_string()))?;
-            let signer = self.relay_pool.client().signer().await
-                .map_err(|e| Error::Encryption(e.to_string()))?;
-            let gift_wrap_event = encryption::gift_wrap_single_layer(
-                &signer, recipient, &event_json,
-            ).await?;
+            let gift_wrap_event =
+                encryption::gift_wrap_single_layer(&signer, recipient, &event_json).await?;
             self.relay_pool.publish_event(&gift_wrap_event).await?;
             tracing::debug!(
                 signed_event_id = %signed_event_id,
@@ -192,24 +195,60 @@ mod tests {
 
     #[test]
     fn test_should_encrypt_disabled_mode() {
-        assert!(!should_encrypt(EncryptionMode::Disabled, CTXVM_MESSAGES_KIND, None));
-        assert!(!should_encrypt(EncryptionMode::Disabled, CTXVM_MESSAGES_KIND, Some(true)));
-        assert!(!should_encrypt(EncryptionMode::Disabled, CTXVM_MESSAGES_KIND, Some(false)));
+        assert!(!should_encrypt(
+            EncryptionMode::Disabled,
+            CTXVM_MESSAGES_KIND,
+            None
+        ));
+        assert!(!should_encrypt(
+            EncryptionMode::Disabled,
+            CTXVM_MESSAGES_KIND,
+            Some(true)
+        ));
+        assert!(!should_encrypt(
+            EncryptionMode::Disabled,
+            CTXVM_MESSAGES_KIND,
+            Some(false)
+        ));
     }
 
     #[test]
     fn test_should_encrypt_required_mode() {
-        assert!(should_encrypt(EncryptionMode::Required, CTXVM_MESSAGES_KIND, None));
-        assert!(should_encrypt(EncryptionMode::Required, CTXVM_MESSAGES_KIND, Some(false)));
-        assert!(should_encrypt(EncryptionMode::Required, CTXVM_MESSAGES_KIND, Some(true)));
+        assert!(should_encrypt(
+            EncryptionMode::Required,
+            CTXVM_MESSAGES_KIND,
+            None
+        ));
+        assert!(should_encrypt(
+            EncryptionMode::Required,
+            CTXVM_MESSAGES_KIND,
+            Some(false)
+        ));
+        assert!(should_encrypt(
+            EncryptionMode::Required,
+            CTXVM_MESSAGES_KIND,
+            Some(true)
+        ));
     }
 
     #[test]
     fn test_should_encrypt_optional_mode() {
         // Default (None) → true
-        assert!(should_encrypt(EncryptionMode::Optional, CTXVM_MESSAGES_KIND, None));
-        assert!(should_encrypt(EncryptionMode::Optional, CTXVM_MESSAGES_KIND, Some(true)));
-        assert!(!should_encrypt(EncryptionMode::Optional, CTXVM_MESSAGES_KIND, Some(false)));
+        assert!(should_encrypt(
+            EncryptionMode::Optional,
+            CTXVM_MESSAGES_KIND,
+            None
+        ));
+        assert!(should_encrypt(
+            EncryptionMode::Optional,
+            CTXVM_MESSAGES_KIND,
+            Some(true)
+        ));
+        assert!(!should_encrypt(
+            EncryptionMode::Optional,
+            CTXVM_MESSAGES_KIND,
+            Some(false)
+        ));
     }
 
     #[test]
@@ -237,10 +276,9 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
         // Create a dummy event ID
-        let event_id = EventId::from_hex(
-            "0000000000000000000000000000000000000000000000000000000000000001",
-        )
-        .unwrap();
+        let event_id =
+            EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
         let tags = BaseTransport::create_response_tags(&pubkey, &event_id);
         assert_eq!(tags.len(), 2);
 

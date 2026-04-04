@@ -122,7 +122,16 @@ impl NostrServerTransport {
         let encryption_mode = self.config.encryption_mode;
 
         tokio::spawn(async move {
-            Self::event_loop(client, sessions, event_to_client, tx, allowed, excluded, encryption_mode).await;
+            Self::event_loop(
+                client,
+                sessions,
+                event_to_client,
+                tx,
+                allowed,
+                excluded,
+                encryption_mode,
+            )
+            .await;
         });
 
         // Spawn session cleanup
@@ -159,11 +168,7 @@ impl NostrServerTransport {
     }
 
     /// Send a response back to the client that sent the original request.
-    pub async fn send_response(
-        &self,
-        event_id: &str,
-        mut response: JsonRpcMessage,
-    ) -> Result<()> {
+    pub async fn send_response(&self, event_id: &str, mut response: JsonRpcMessage) -> Result<()> {
         let event_to_client = self.event_to_client.read().await;
         let client_pubkey_hex = event_to_client
             .get(event_id)
@@ -188,8 +193,8 @@ impl NostrServerTransport {
         let is_encrypted = session.is_encrypted;
         drop(sessions);
 
-        let client_pubkey = PublicKey::from_hex(&client_pubkey_hex)
-            .map_err(|e| Error::Other(e.to_string()))?;
+        let client_pubkey =
+            PublicKey::from_hex(&client_pubkey_hex).map_err(|e| Error::Other(e.to_string()))?;
 
         let event_id_parsed =
             EventId::from_hex(event_id).map_err(|e| Error::Other(e.to_string()))?;
@@ -236,8 +241,8 @@ impl NostrServerTransport {
         let is_encrypted = session.is_encrypted;
         drop(sessions);
 
-        let client_pubkey = PublicKey::from_hex(client_pubkey_hex)
-            .map_err(|e| Error::Other(e.to_string()))?;
+        let client_pubkey =
+            PublicKey::from_hex(client_pubkey_hex).map_err(|e| Error::Other(e.to_string()))?;
 
         let mut tags = BaseTransport::create_recipient_tags(&client_pubkey);
         if let Some(eid) = correlated_event_id {
@@ -329,8 +334,7 @@ impl NostrServerTransport {
             ));
         }
 
-        let builder =
-            EventBuilder::new(Kind::Custom(SERVER_ANNOUNCEMENT_KIND), content).tags(tags);
+        let builder = EventBuilder::new(Kind::Custom(SERVER_ANNOUNCEMENT_KIND), content).tags(tags);
 
         self.base.relay_pool.publish(builder).await
     }
@@ -385,11 +389,10 @@ impl NostrServerTransport {
         let _pubkey_hex = pubkey.to_hex();
 
         for kind in UNENCRYPTED_KINDS {
-            let builder = EventBuilder::new(Kind::Custom(5), reason)
-                .tag(Tag::custom(
-                    TagKind::Custom("k".into()),
-                    vec![kind.to_string()],
-                ));
+            let builder = EventBuilder::new(Kind::Custom(5), reason).tag(Tag::custom(
+                TagKind::Custom("k".into()),
+                vec![kind.to_string()],
+            ));
             self.base.relay_pool.publish(builder).await?;
         }
         Ok(())
@@ -481,60 +484,60 @@ impl NostrServerTransport {
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
-                let (content, sender_pubkey, event_id, is_encrypted) =
-                    if event.kind == Kind::Custom(GIFT_WRAP_KIND)
-                        || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
-                    {
-                        if encryption_mode == EncryptionMode::Disabled {
-                            tracing::warn!("Received encrypted message but encryption is disabled");
+                let (content, sender_pubkey, event_id, is_encrypted) = if event.kind
+                    == Kind::Custom(GIFT_WRAP_KIND)
+                    || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
+                {
+                    if encryption_mode == EncryptionMode::Disabled {
+                        tracing::warn!("Received encrypted message but encryption is disabled");
+                        continue;
+                    }
+                    // Single-layer NIP-44 decrypt (matches JS/TS SDK)
+                    let signer = match client.signer().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("Failed to get signer: {e}");
                             continue;
                         }
-                        // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                        let signer = match client.signer().await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::error!("Failed to get signer: {e}");
-                                continue;
-                            }
-                        };
-                        match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
-                            Ok(decrypted_json) => {
-                                // The decrypted content is JSON of the inner signed event.
-                                // Use the INNER event's ID for correlation — the client
-                                // registers the inner event ID in its correlation store.
-                                match serde_json::from_str::<Event>(&decrypted_json) {
-                                    Ok(inner) => (
-                                        inner.content,
-                                        inner.pubkey.to_hex(),
-                                        inner.id.to_hex(),
-                                        true,
-                                    ),
-                                    Err(e) => {
-                                        tracing::error!("Failed to parse inner event: {e}");
-                                        continue;
-                                    }
+                    };
+                    match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
+                        Ok(decrypted_json) => {
+                            // The decrypted content is JSON of the inner signed event.
+                            // Use the INNER event's ID for correlation — the client
+                            // registers the inner event ID in its correlation store.
+                            match serde_json::from_str::<Event>(&decrypted_json) {
+                                Ok(inner) => (
+                                    inner.content,
+                                    inner.pubkey.to_hex(),
+                                    inner.id.to_hex(),
+                                    true,
+                                ),
+                                Err(e) => {
+                                    tracing::error!("Failed to parse inner event: {e}");
+                                    continue;
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("Failed to decrypt: {e}");
-                                continue;
-                            }
                         }
-                    } else {
-                        if encryption_mode == EncryptionMode::Required {
-                            tracing::warn!(
-                                pubkey = %event.pubkey,
-                                "Received unencrypted message but encryption is required"
-                            );
+                        Err(e) => {
+                            tracing::error!("Failed to decrypt: {e}");
                             continue;
                         }
-                        (
-                            event.content.clone(),
-                            event.pubkey.to_hex(),
-                            event.id.to_hex(),
-                            false,
-                        )
-                    };
+                    }
+                } else {
+                    if encryption_mode == EncryptionMode::Required {
+                        tracing::warn!(
+                            pubkey = %event.pubkey,
+                            "Received unencrypted message but encryption is required"
+                        );
+                        continue;
+                    }
+                    (
+                        event.content.clone(),
+                        event.pubkey.to_hex(),
+                        event.id.to_hex(),
+                        false,
+                    )
+                };
 
                 // Parse MCP message
                 let mcp_msg = match serializers::nostr_event_to_mcp_message(&content) {
@@ -688,22 +691,36 @@ mod tests {
 
         // Insert a session with an old activity time
         let mut session = ClientSession::new(false);
-        session.pending_requests.insert("evt1".to_string(), serde_json::json!(1));
-        sessions.write().await.insert("pubkey1".to_string(), session);
-        event_to_client.write().await.insert("evt1".to_string(), "pubkey1".to_string());
+        session
+            .pending_requests
+            .insert("evt1".to_string(), serde_json::json!(1));
+        sessions
+            .write()
+            .await
+            .insert("pubkey1".to_string(), session);
+        event_to_client
+            .write()
+            .await
+            .insert("evt1".to_string(), "pubkey1".to_string());
 
         // With a long timeout, nothing should be cleaned
         let cleaned = NostrServerTransport::cleanup_sessions(
-            &sessions, &event_to_client, Duration::from_secs(300),
-        ).await;
+            &sessions,
+            &event_to_client,
+            Duration::from_secs(300),
+        )
+        .await;
         assert_eq!(cleaned, 0);
         assert_eq!(sessions.read().await.len(), 1);
 
         // With zero timeout, it should be cleaned
         thread::sleep(Duration::from_millis(5));
         let cleaned = NostrServerTransport::cleanup_sessions(
-            &sessions, &event_to_client, Duration::from_millis(1),
-        ).await;
+            &sessions,
+            &event_to_client,
+            Duration::from_millis(1),
+        )
+        .await;
         assert_eq!(cleaned, 1);
         assert!(sessions.read().await.is_empty());
         assert!(event_to_client.read().await.is_empty());
@@ -718,8 +735,11 @@ mod tests {
         sessions.write().await.insert("active".to_string(), session);
 
         let cleaned = NostrServerTransport::cleanup_sessions(
-            &sessions, &event_to_client, Duration::from_secs(300),
-        ).await;
+            &sessions,
+            &event_to_client,
+            Duration::from_secs(300),
+        )
+        .await;
         assert_eq!(cleaned, 0);
         assert_eq!(sessions.read().await.len(), 1);
     }
@@ -729,24 +749,44 @@ mod tests {
     #[test]
     fn test_pending_request_tracking() {
         let mut session = ClientSession::new(false);
-        session.pending_requests.insert("event_abc".to_string(), serde_json::json!(42));
-        assert_eq!(session.pending_requests.get("event_abc"), Some(&serde_json::json!(42)));
+        session
+            .pending_requests
+            .insert("event_abc".to_string(), serde_json::json!(42));
+        assert_eq!(
+            session.pending_requests.get("event_abc"),
+            Some(&serde_json::json!(42))
+        );
     }
 
     #[test]
     fn test_progress_token_tracking() {
         let mut session = ClientSession::new(false);
-        session.event_to_progress_token.insert("evt1".to_string(), "token1".to_string());
-        session.pending_requests.insert("token1".to_string(), serde_json::json!("evt1"));
-        assert_eq!(session.event_to_progress_token.get("evt1"), Some(&"token1".to_string()));
+        session
+            .event_to_progress_token
+            .insert("evt1".to_string(), "token1".to_string());
+        session
+            .pending_requests
+            .insert("token1".to_string(), serde_json::json!("evt1"));
+        assert_eq!(
+            session.event_to_progress_token.get("evt1"),
+            Some(&"token1".to_string())
+        );
     }
 
     // ── Authorization (is_capability_excluded) ──────────────────
 
     #[test]
     fn test_initialize_always_excluded() {
-        assert!(NostrServerTransport::is_capability_excluded(&[], "initialize", None));
-        assert!(NostrServerTransport::is_capability_excluded(&[], "notifications/initialized", None));
+        assert!(NostrServerTransport::is_capability_excluded(
+            &[],
+            "initialize",
+            None
+        ));
+        assert!(NostrServerTransport::is_capability_excluded(
+            &[],
+            "notifications/initialized",
+            None
+        ));
     }
 
     #[test]
@@ -755,8 +795,16 @@ mod tests {
             method: "tools/list".to_string(),
             name: None,
         }];
-        assert!(NostrServerTransport::is_capability_excluded(&exclusions, "tools/list", None));
-        assert!(NostrServerTransport::is_capability_excluded(&exclusions, "tools/list", Some("anything")));
+        assert!(NostrServerTransport::is_capability_excluded(
+            &exclusions,
+            "tools/list",
+            None
+        ));
+        assert!(NostrServerTransport::is_capability_excluded(
+            &exclusions,
+            "tools/list",
+            Some("anything")
+        ));
     }
 
     #[test]
@@ -765,9 +813,21 @@ mod tests {
             method: "tools/call".to_string(),
             name: Some("get_weather".to_string()),
         }];
-        assert!(NostrServerTransport::is_capability_excluded(&exclusions, "tools/call", Some("get_weather")));
-        assert!(!NostrServerTransport::is_capability_excluded(&exclusions, "tools/call", Some("other_tool")));
-        assert!(!NostrServerTransport::is_capability_excluded(&exclusions, "tools/call", None));
+        assert!(NostrServerTransport::is_capability_excluded(
+            &exclusions,
+            "tools/call",
+            Some("get_weather")
+        ));
+        assert!(!NostrServerTransport::is_capability_excluded(
+            &exclusions,
+            "tools/call",
+            Some("other_tool")
+        ));
+        assert!(!NostrServerTransport::is_capability_excluded(
+            &exclusions,
+            "tools/call",
+            None
+        ));
     }
 
     #[test]
@@ -776,14 +836,30 @@ mod tests {
             method: "tools/list".to_string(),
             name: None,
         }];
-        assert!(!NostrServerTransport::is_capability_excluded(&exclusions, "tools/call", None));
-        assert!(!NostrServerTransport::is_capability_excluded(&exclusions, "resources/list", None));
+        assert!(!NostrServerTransport::is_capability_excluded(
+            &exclusions,
+            "tools/call",
+            None
+        ));
+        assert!(!NostrServerTransport::is_capability_excluded(
+            &exclusions,
+            "resources/list",
+            None
+        ));
     }
 
     #[test]
     fn test_empty_exclusions_non_init_method() {
-        assert!(!NostrServerTransport::is_capability_excluded(&[], "tools/list", None));
-        assert!(!NostrServerTransport::is_capability_excluded(&[], "tools/call", Some("x")));
+        assert!(!NostrServerTransport::is_capability_excluded(
+            &[],
+            "tools/list",
+            None
+        ));
+        assert!(!NostrServerTransport::is_capability_excluded(
+            &[],
+            "tools/call",
+            Some("x")
+        ));
     }
 
     // ── Encryption mode enforcement ─────────────────────────────

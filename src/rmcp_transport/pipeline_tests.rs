@@ -16,13 +16,18 @@
 mod tests {
     use std::collections::HashMap;
 
-    use rmcp::model::{ClientJsonRpcMessage, ClientResult, RequestId, ServerJsonRpcMessage, ServerResult};
+    use rmcp::model::{
+        ClientJsonRpcMessage, ClientResult, RequestId, ServerJsonRpcMessage, ServerResult,
+    };
 
     use crate::core::serializers;
-    use crate::core::types::{JsonRpcError, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+    use crate::core::types::{
+        JsonRpcError, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+        JsonRpcResponse,
+    };
     use crate::rmcp_transport::convert::{
-        internal_to_rmcp_client_rx, internal_to_rmcp_server_rx,
-        rmcp_client_tx_to_internal, rmcp_server_tx_to_internal,
+        internal_to_rmcp_client_rx, internal_to_rmcp_server_rx, rmcp_client_tx_to_internal,
+        rmcp_server_tx_to_internal,
     };
 
     // ── Layer 1: Nostr event content → JsonRpcMessage ──────────────────────
@@ -110,8 +115,8 @@ mod tests {
             method: "notifications/initialized".to_string(),
             params: None,
         });
-        let rmcp = internal_to_rmcp_server_rx(&msg)
-            .expect("initialized notification should convert");
+        let rmcp =
+            internal_to_rmcp_server_rx(&msg).expect("initialized notification should convert");
         let v = serde_json::to_value(&rmcp).unwrap();
         assert_eq!(v["method"], "notifications/initialized");
     }
@@ -134,12 +139,10 @@ mod tests {
     #[test]
     fn layer4_rmcp_ping_response_roundtrip_number_id() {
         // Simulate rmcp handler producing a ping response
-        let rmcp_response = ServerJsonRpcMessage::response(
-            ServerResult::empty(()),
-            RequestId::Number(42),
-        );
-        let internal = rmcp_server_tx_to_internal(rmcp_response)
-            .expect("ping response should convert back");
+        let rmcp_response =
+            ServerJsonRpcMessage::response(ServerResult::empty(()), RequestId::Number(42));
+        let internal =
+            rmcp_server_tx_to_internal(rmcp_response).expect("ping response should convert back");
 
         match internal {
             JsonRpcMessage::Response(r) => {
@@ -180,10 +183,8 @@ mod tests {
         assert_eq!(id_seen_by_rmcp, serde_json::json!(99));
 
         // Layer 4: rmcp produces a response with the same ID echoed back
-        let rmcp_tx = ServerJsonRpcMessage::response(
-            ServerResult::empty(()),
-            RequestId::Number(99),
-        );
+        let rmcp_tx =
+            ServerJsonRpcMessage::response(ServerResult::empty(()), RequestId::Number(99));
         let response = rmcp_server_tx_to_internal(rmcp_tx).unwrap();
 
         // The response ID must equal the original request ID
@@ -193,10 +194,7 @@ mod tests {
     #[test]
     fn full_client_roundtrip_response_id_preserved() {
         // Client side: rmcp produces an outbound request
-        let rmcp_tx = ClientJsonRpcMessage::response(
-            ClientResult::empty(()),
-            RequestId::Number(7),
-        );
+        let rmcp_tx = ClientJsonRpcMessage::response(ClientResult::empty(()), RequestId::Number(7));
         let internal = rmcp_client_tx_to_internal(rmcp_tx).unwrap();
         assert_eq!(internal.id(), Some(&serde_json::json!(7)));
 
@@ -268,13 +266,19 @@ mod tests {
 
         // Key derived from response ID must match the one stored from request ID
         assert_eq!(key, resp_key);
-        assert_eq!(request_id_to_event_id.remove(&resp_key), Some(fake_event_id));
+        assert_eq!(
+            request_id_to_event_id.remove(&resp_key),
+            Some(fake_event_id)
+        );
     }
 
     #[test]
     fn layer5_error_response_correlation_works() {
         let mut map: HashMap<String, String> = HashMap::new();
-        map.insert(serde_json::to_string(&serde_json::json!(5)).unwrap(), "evt5".to_string());
+        map.insert(
+            serde_json::to_string(&serde_json::json!(5)).unwrap(),
+            "evt5".to_string(),
+        );
 
         let error_response = JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
             jsonrpc: "2.0".to_string(),

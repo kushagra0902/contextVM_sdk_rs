@@ -40,9 +40,7 @@ impl NostrMCPGateway {
     ///
     /// The caller is responsible for processing requests and calling
     /// `send_response` for each one.
-    pub async fn start(
-        &mut self,
-    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>> {
+    pub async fn start(&mut self) -> Result<tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>> {
         if self.is_running {
             return Err(Error::Other("Gateway already running".to_string()));
         }
@@ -133,11 +131,27 @@ mod tests {
 
         let config = GatewayConfig { nostr_config };
 
-        assert_eq!(config.nostr_config.relay_urls, vec!["wss://relay.example.com"]);
-        assert_eq!(config.nostr_config.encryption_mode, EncryptionMode::Required);
+        assert_eq!(
+            config.nostr_config.relay_urls,
+            vec!["wss://relay.example.com"]
+        );
+        assert_eq!(
+            config.nostr_config.encryption_mode,
+            EncryptionMode::Required
+        );
         assert!(config.nostr_config.is_announced_server);
         assert_eq!(config.nostr_config.allowed_public_keys.len(), 1);
-        assert!(config.nostr_config.server_info.as_ref().unwrap().name.as_ref().unwrap() == "Test Gateway");
+        assert!(
+            config
+                .nostr_config
+                .server_info
+                .as_ref()
+                .unwrap()
+                .name
+                .as_ref()
+                .unwrap()
+                == "Test Gateway"
+        );
     }
 
     #[test]
@@ -145,7 +159,10 @@ mod tests {
         let config = GatewayConfig {
             nostr_config: NostrServerTransportConfig::default(),
         };
-        assert_eq!(config.nostr_config.encryption_mode, EncryptionMode::Optional);
+        assert_eq!(
+            config.nostr_config.encryption_mode,
+            EncryptionMode::Optional
+        );
         assert!(!config.nostr_config.is_announced_server);
     }
 }

@@ -42,7 +42,10 @@ async fn main() -> contextvm_sdk::Result<()> {
 
     // Wait for response
     if let Some(response) = rx.recv().await {
-        println!("Response: {}", serde_json::to_string_pretty(&response).unwrap());
+        println!(
+            "Response: {}",
+            serde_json::to_string_pretty(&response).unwrap()
+        );
     }
 
     proxy.stop().await?;

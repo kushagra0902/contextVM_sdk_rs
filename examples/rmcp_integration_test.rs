@@ -19,7 +19,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use contextvm_sdk::core::constants::MCP_PROTOCOL_VERSION;
 use contextvm_sdk::core::types::{
-    EncryptionMode, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, ServerInfo as CtxServerInfo,
+    EncryptionMode, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    ServerInfo as CtxServerInfo,
 };
 use contextvm_sdk::gateway::{GatewayConfig, NostrMCPGateway};
 use contextvm_sdk::proxy::{NostrMCPProxy, ProxyConfig};
@@ -27,11 +28,8 @@ use contextvm_sdk::signer;
 use contextvm_sdk::transport::client::NostrClientTransportConfig;
 use contextvm_sdk::transport::server::NostrServerTransportConfig;
 use rmcp::{
-    handler::server::wrapper::Parameters,
-    model::*,
-    schemars,
-    service::RequestContext,
-    tool, tool_handler, tool_router, ClientHandler, RoleServer, ServerHandler, ServiceExt,
+    handler::server::wrapper::Parameters, model::*, schemars, service::RequestContext, tool,
+    tool_handler, tool_router, ClientHandler, RoleServer, ServerHandler, ServiceExt,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,9 +56,7 @@ impl Mode {
             "hybrid" => Ok(Self::Hybrid),
             "relay-rmcp" => Ok(Self::RelayRmcp),
             "all" => Ok(Self::All),
-            other => bail!(
-                "Unknown mode '{other}'. Use one of: local | hybrid | relay-rmcp | all"
-            ),
+            other => bail!("Unknown mode '{other}'. Use one of: local | hybrid | relay-rmcp | all"),
         }
     }
 
@@ -168,7 +164,7 @@ impl ServerHandler for DemoServer {
     ) -> Result<ListResourcesResult, ErrorData> {
         Ok(ListResourcesResult {
             resources: vec![
-                RawResource::new("demo://readme", "Demo README".to_string()).no_annotation(),
+                RawResource::new("demo://readme", "Demo README".to_string()).no_annotation()
             ],
             next_cursor: None,
             meta: None,
@@ -273,7 +269,11 @@ async fn run_local_rmcp_case() -> Result<()> {
     assert!(add_text.contains("12"), "expected add result to include 12");
 
     let resources = client.list_all_resources().await?;
-    assert_eq!(resources.len(), 1, "expected one resource in local rmcp case");
+    assert_eq!(
+        resources.len(),
+        1,
+        "expected one resource in local rmcp case"
+    );
 
     match client.call_tool(call_params("no_such_tool", None)).await {
         Err(_) => {}
@@ -303,9 +303,7 @@ async fn run_hybrid_relay_case(relay_url: &str) -> Result<()> {
             DemoServer::new(),
         )
         .await
-        .with_context(|| {
-            format!("failed to start rmcp server on relay {relay_url_owned}")
-        })?;
+        .with_context(|| format!("failed to start rmcp server on relay {relay_url_owned}"))?;
 
         let _ = server
             .waiting()
@@ -355,23 +353,23 @@ async fn run_hybrid_relay_case(relay_url: &str) -> Result<()> {
             .context("failed to start legacy proxy")?;
         println!("[relay-hybrid] stage: legacy proxy started");
 
-    let init_id = serde_json::json!(1);
-    let init_request = JsonRpcMessage::Request(JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: init_id.clone(),
-        method: "initialize".to_string(),
-        params: Some(serde_json::json!({
-            "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": {
-                "tools": {},
-                "resources": {}
-            },
-            "clientInfo": {
-                "name": "legacy-hybrid-client",
-                "version": "0.1.0"
-            }
-        })),
-    });
+        let init_id = serde_json::json!(1);
+        let init_request = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: init_id.clone(),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {
+                    "tools": {},
+                    "resources": {}
+                },
+                "clientInfo": {
+                    "name": "legacy-hybrid-client",
+                    "version": "0.1.0"
+                }
+            })),
+        });
 
         let init_response =
             send_legacy_request_and_wait(&proxy, &mut rx, init_request, &init_id).await?;
@@ -472,9 +470,7 @@ async fn run_relay_rmcp_case(relay_url: &str) -> Result<()> {
             DemoServer::new(),
         )
         .await
-        .with_context(|| {
-            format!("failed to start rmcp server on relay {relay_url_owned}")
-        })?;
+        .with_context(|| format!("failed to start rmcp server on relay {relay_url_owned}"))?;
 
         let _ = server
             .waiting()
@@ -687,7 +683,10 @@ fn assert_error_response(response: &JsonRpcMessage) -> Result<()> {
     match response {
         JsonRpcMessage::ErrorResponse(err) => {
             if err.error.code >= 0 {
-                bail!("expected negative JSON-RPC error code, got {}", err.error.code);
+                bail!(
+                    "expected negative JSON-RPC error code, got {}",
+                    err.error.code
+                );
             }
             Ok(())
         }

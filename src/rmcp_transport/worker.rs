@@ -12,310 +12,316 @@ use crate::transport::server::{NostrServerTransport, NostrServerTransportConfig}
 use rmcp::transport::worker::{Worker, WorkerContext, WorkerQuitReason};
 
 use super::convert::{
-	internal_to_rmcp_client_rx, internal_to_rmcp_server_rx, rmcp_client_tx_to_internal,
-	rmcp_server_tx_to_internal,
+    internal_to_rmcp_client_rx, internal_to_rmcp_server_rx, rmcp_client_tx_to_internal,
+    rmcp_server_tx_to_internal,
 };
 
 /// rmcp server worker wrapper for ContextVM Nostr server transport.
 pub struct NostrServerWorker {
-	transport: NostrServerTransport,
-	// rmcp service instance is single-peer. Keep one active client per worker.
-	active_client_pubkey: Option<String>,
-	// Maps request id (serialized JSON value) -> incoming Nostr event id.
-	request_id_to_event_id: HashMap<String, String>,
+    transport: NostrServerTransport,
+    // rmcp service instance is single-peer. Keep one active client per worker.
+    active_client_pubkey: Option<String>,
+    // Maps request id (serialized JSON value) -> incoming Nostr event id.
+    request_id_to_event_id: HashMap<String, String>,
 }
 
 impl NostrServerWorker {
-	/// Create a new server worker from existing server transport config.
-	pub async fn new<T>(signer: T, config: NostrServerTransportConfig) -> Result<Self>
-	where
-		T: nostr_sdk::prelude::IntoNostrSigner,
-	{
-		let transport = NostrServerTransport::new(signer, config).await?;
-		Ok(Self {
-			transport,
-			active_client_pubkey: None,
-			request_id_to_event_id: HashMap::new(),
-		})
-	}
+    /// Create a new server worker from existing server transport config.
+    pub async fn new<T>(signer: T, config: NostrServerTransportConfig) -> Result<Self>
+    where
+        T: nostr_sdk::prelude::IntoNostrSigner,
+    {
+        let transport = NostrServerTransport::new(signer, config).await?;
+        Ok(Self {
+            transport,
+            active_client_pubkey: None,
+            request_id_to_event_id: HashMap::new(),
+        })
+    }
 
-	/// Access the wrapped transport.
-	pub fn transport(&self) -> &NostrServerTransport {
-		&self.transport
-	}
+    /// Access the wrapped transport.
+    pub fn transport(&self) -> &NostrServerTransport {
+        &self.transport
+    }
 }
 
 impl Worker for NostrServerWorker {
-	type Error = crate::core::error::Error;
-	type Role = rmcp::RoleServer;
+    type Error = crate::core::error::Error;
+    type Role = rmcp::RoleServer;
 
-	fn err_closed() -> Self::Error {
-		Self::Error::Transport("rmcp worker channel closed".to_string())
-	}
+    fn err_closed() -> Self::Error {
+        Self::Error::Transport("rmcp worker channel closed".to_string())
+    }
 
-	fn err_join(e: tokio::task::JoinError) -> Self::Error {
-		Self::Error::Other(format!("rmcp worker join error: {e}"))
-	}
+    fn err_join(e: tokio::task::JoinError) -> Self::Error {
+        Self::Error::Other(format!("rmcp worker join error: {e}"))
+    }
 
-	async fn run(
-		mut self,
-		mut context: WorkerContext<Self>,
-	) -> std::result::Result<(), WorkerQuitReason<Self::Error>> {
-		self.transport
-			.start()
-			.await
-			.map_err(WorkerQuitReason::fatal_context("starting server transport"))?;
+    async fn run(
+        mut self,
+        mut context: WorkerContext<Self>,
+    ) -> std::result::Result<(), WorkerQuitReason<Self::Error>> {
+        self.transport
+            .start()
+            .await
+            .map_err(WorkerQuitReason::fatal_context("starting server transport"))?;
 
-		let mut rx = self.transport.take_message_receiver().ok_or_else(|| {
-			WorkerQuitReason::fatal(
-				Self::Error::Other("server message receiver already taken".to_string()),
-				"taking server message receiver",
-			)
-		})?;
+        let mut rx = self.transport.take_message_receiver().ok_or_else(|| {
+            WorkerQuitReason::fatal(
+                Self::Error::Other("server message receiver already taken".to_string()),
+                "taking server message receiver",
+            )
+        })?;
 
-		let cancellation_token = context.cancellation_token.clone();
+        let cancellation_token = context.cancellation_token.clone();
 
-		let quit_reason = loop {
-			tokio::select! {
-				_ = cancellation_token.cancelled() => {
-					break WorkerQuitReason::Cancelled;
-				}
-				incoming = rx.recv() => {
-					let Some(incoming) = incoming else {
-						break WorkerQuitReason::TransportClosed;
-					};
+        let quit_reason = loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    break WorkerQuitReason::Cancelled;
+                }
+                incoming = rx.recv() => {
+                    let Some(incoming) = incoming else {
+                        break WorkerQuitReason::TransportClosed;
+                    };
 
-					let crate::transport::server::IncomingRequest {
-						message,
-						client_pubkey,
-						event_id,
-						..
-					} = incoming;
+                    let crate::transport::server::IncomingRequest {
+                        message,
+                        client_pubkey,
+                        event_id,
+                        ..
+                    } = incoming;
 
-					match &self.active_client_pubkey {
-						Some(active) if active != &client_pubkey => {
-							tracing::warn!(
-								active_client = %active,
-								ignored_client = %client_pubkey,
-								"Ignoring message from second client: rmcp server worker currently supports one active client per worker"
-							);
-							continue;
-						}
-						None => {
-							tracing::info!(client_pubkey = %client_pubkey, "Binding rmcp server worker to first client session");
-							self.active_client_pubkey = Some(client_pubkey.clone());
-						}
-						_ => {}
-					}
+                    match &self.active_client_pubkey {
+                        Some(active) if active != &client_pubkey => {
+                            tracing::warn!(
+                                active_client = %active,
+                                ignored_client = %client_pubkey,
+                                "Ignoring message from second client: rmcp server worker currently supports one active client per worker"
+                            );
+                            continue;
+                        }
+                        None => {
+                            tracing::info!(client_pubkey = %client_pubkey, "Binding rmcp server worker to first client session");
+                            self.active_client_pubkey = Some(client_pubkey.clone());
+                        }
+                        _ => {}
+                    }
 
-					if let JsonRpcMessage::Request(req) = &message {
-						match serde_json::to_string(&req.id) {
-							Ok(request_key) => {
-								self.request_id_to_event_id.insert(request_key, event_id);
-							}
-							Err(e) => {
-								tracing::warn!("Failed to serialize request id for correlation map: {e}");
-							}
-						}
-					}
+                    if let JsonRpcMessage::Request(req) = &message {
+                        match serde_json::to_string(&req.id) {
+                            Ok(request_key) => {
+                                self.request_id_to_event_id.insert(request_key, event_id);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to serialize request id for correlation map: {e}");
+                            }
+                        }
+                    }
 
-					if let Some(rmcp_msg) = internal_to_rmcp_server_rx(&message) {
-						if let Err(reason) = context.send_to_handler(rmcp_msg).await {
-							break reason;
-						}
-					} else {
-						tracing::warn!("Failed to convert incoming server-side message to rmcp format");
-					}
-				}
-				outbound = context.recv_from_handler() => {
-					let outbound = match outbound {
-						Ok(outbound) => outbound,
-						Err(reason) => break reason,
-					};
+                    if let Some(rmcp_msg) = internal_to_rmcp_server_rx(&message) {
+                        if let Err(reason) = context.send_to_handler(rmcp_msg).await {
+                            break reason;
+                        }
+                    } else {
+                        tracing::warn!("Failed to convert incoming server-side message to rmcp format");
+                    }
+                }
+                outbound = context.recv_from_handler() => {
+                    let outbound = match outbound {
+                        Ok(outbound) => outbound,
+                        Err(reason) => break reason,
+                    };
 
-					let result = if let Some(internal_msg) = rmcp_server_tx_to_internal(outbound.message) {
-						self.forward_server_internal(internal_msg).await
-					} else {
-						Err(Self::Error::Validation(
-							"failed converting rmcp server message to internal JSON-RPC".to_string(),
-						))
-					};
+                    let result = if let Some(internal_msg) = rmcp_server_tx_to_internal(outbound.message) {
+                        self.forward_server_internal(internal_msg).await
+                    } else {
+                        Err(Self::Error::Validation(
+                            "failed converting rmcp server message to internal JSON-RPC".to_string(),
+                        ))
+                    };
 
-					let _ = outbound.responder.send(result);
-				}
-			}
-		};
+                    let _ = outbound.responder.send(result);
+                }
+            }
+        };
 
-		if let Err(e) = self.transport.close().await {
-			tracing::warn!("Failed to close server transport cleanly: {e}");
-		}
+        if let Err(e) = self.transport.close().await {
+            tracing::warn!("Failed to close server transport cleanly: {e}");
+        }
 
-		Err(quit_reason)
-	}
+        Err(quit_reason)
+    }
 }
 
 /// rmcp client worker wrapper for ContextVM Nostr client transport.
 pub struct NostrClientWorker {
-	transport: NostrClientTransport,
+    transport: NostrClientTransport,
 }
 
 impl NostrClientWorker {
-	/// Create a new client worker from existing client transport config.
-	pub async fn new<T>(signer: T, config: NostrClientTransportConfig) -> Result<Self>
-	where
-		T: nostr_sdk::prelude::IntoNostrSigner,
-	{
-		let transport = NostrClientTransport::new(signer, config).await?;
-		Ok(Self { transport })
-	}
+    /// Create a new client worker from existing client transport config.
+    pub async fn new<T>(signer: T, config: NostrClientTransportConfig) -> Result<Self>
+    where
+        T: nostr_sdk::prelude::IntoNostrSigner,
+    {
+        let transport = NostrClientTransport::new(signer, config).await?;
+        Ok(Self { transport })
+    }
 
-	/// Access the wrapped transport.
-	pub fn transport(&self) -> &NostrClientTransport {
-		&self.transport
-	}
+    /// Access the wrapped transport.
+    pub fn transport(&self) -> &NostrClientTransport {
+        &self.transport
+    }
 }
 
 impl Worker for NostrClientWorker {
-	type Error = crate::core::error::Error;
-	type Role = rmcp::RoleClient;
+    type Error = crate::core::error::Error;
+    type Role = rmcp::RoleClient;
 
-	fn err_closed() -> Self::Error {
-		Self::Error::Transport("rmcp worker channel closed".to_string())
-	}
+    fn err_closed() -> Self::Error {
+        Self::Error::Transport("rmcp worker channel closed".to_string())
+    }
 
-	fn err_join(e: tokio::task::JoinError) -> Self::Error {
-		Self::Error::Other(format!("rmcp worker join error: {e}"))
-	}
+    fn err_join(e: tokio::task::JoinError) -> Self::Error {
+        Self::Error::Other(format!("rmcp worker join error: {e}"))
+    }
 
-	async fn run(
-		mut self,
-		mut context: WorkerContext<Self>,
-	) -> std::result::Result<(), WorkerQuitReason<Self::Error>> {
-		self.transport
-			.start()
-			.await
-			.map_err(WorkerQuitReason::fatal_context("starting client transport"))?;
+    async fn run(
+        mut self,
+        mut context: WorkerContext<Self>,
+    ) -> std::result::Result<(), WorkerQuitReason<Self::Error>> {
+        self.transport
+            .start()
+            .await
+            .map_err(WorkerQuitReason::fatal_context("starting client transport"))?;
 
-		let mut rx = self.transport.take_message_receiver().ok_or_else(|| {
-			WorkerQuitReason::fatal(
-				Self::Error::Other("client message receiver already taken".to_string()),
-				"taking client message receiver",
-			)
-		})?;
+        let mut rx = self.transport.take_message_receiver().ok_or_else(|| {
+            WorkerQuitReason::fatal(
+                Self::Error::Other("client message receiver already taken".to_string()),
+                "taking client message receiver",
+            )
+        })?;
 
-		let cancellation_token = context.cancellation_token.clone();
+        let cancellation_token = context.cancellation_token.clone();
 
-		let quit_reason = loop {
-			tokio::select! {
-				_ = cancellation_token.cancelled() => {
-					break WorkerQuitReason::Cancelled;
-				}
-				incoming = rx.recv() => {
-					let Some(incoming) = incoming else {
-						break WorkerQuitReason::TransportClosed;
-					};
+        let quit_reason = loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    break WorkerQuitReason::Cancelled;
+                }
+                incoming = rx.recv() => {
+                    let Some(incoming) = incoming else {
+                        break WorkerQuitReason::TransportClosed;
+                    };
 
-					if let Some(rmcp_msg) = internal_to_rmcp_client_rx(&incoming) {
-						if let Err(reason) = context.send_to_handler(rmcp_msg).await {
-							break reason;
-						}
-					} else {
-						tracing::warn!("Failed to convert incoming client-side message to rmcp format");
-					}
-				}
-				outbound = context.recv_from_handler() => {
-					let outbound = match outbound {
-						Ok(outbound) => outbound,
-						Err(reason) => break reason,
-					};
+                    if let Some(rmcp_msg) = internal_to_rmcp_client_rx(&incoming) {
+                        if let Err(reason) = context.send_to_handler(rmcp_msg).await {
+                            break reason;
+                        }
+                    } else {
+                        tracing::warn!("Failed to convert incoming client-side message to rmcp format");
+                    }
+                }
+                outbound = context.recv_from_handler() => {
+                    let outbound = match outbound {
+                        Ok(outbound) => outbound,
+                        Err(reason) => break reason,
+                    };
 
-					let result = if let Some(internal_msg) = rmcp_client_tx_to_internal(outbound.message) {
-						self.transport.send(&internal_msg).await
-					} else {
-						Err(Self::Error::Validation(
-							"failed converting rmcp client message to internal JSON-RPC".to_string(),
-						))
-					};
+                    let result = if let Some(internal_msg) = rmcp_client_tx_to_internal(outbound.message) {
+                        self.transport.send(&internal_msg).await
+                    } else {
+                        Err(Self::Error::Validation(
+                            "failed converting rmcp client message to internal JSON-RPC".to_string(),
+                        ))
+                    };
 
-					let _ = outbound.responder.send(result);
-				}
-			}
-		};
+                    let _ = outbound.responder.send(result);
+                }
+            }
+        };
 
-		if let Err(e) = self.transport.close().await {
-			tracing::warn!("Failed to close client transport cleanly: {e}");
-		}
+        if let Err(e) = self.transport.close().await {
+            tracing::warn!("Failed to close client transport cleanly: {e}");
+        }
 
-		Err(quit_reason)
-	}
+        Err(quit_reason)
+    }
 }
 
 impl NostrServerWorker {
-	async fn forward_server_internal(&mut self, message: JsonRpcMessage) -> Result<()> {
-		match message {
-			JsonRpcMessage::Response(resp) => {
-				let request_key = serde_json::to_string(&resp.id).map_err(|e| {
-					crate::core::error::Error::Validation(format!(
-						"failed to serialize rmcp response id for correlation lookup: {e}"
-					))
-				})?;
+    async fn forward_server_internal(&mut self, message: JsonRpcMessage) -> Result<()> {
+        match message {
+            JsonRpcMessage::Response(resp) => {
+                let request_key = serde_json::to_string(&resp.id).map_err(|e| {
+                    crate::core::error::Error::Validation(format!(
+                        "failed to serialize rmcp response id for correlation lookup: {e}"
+                    ))
+                })?;
 
-				let event_id = if let Some(event_id) = self.request_id_to_event_id.remove(&request_key) {
-					event_id
-				} else {
-					resp.id.as_str().map(str::to_owned).ok_or_else(|| {
-						crate::core::error::Error::Validation(
+                let event_id =
+                    if let Some(event_id) = self.request_id_to_event_id.remove(&request_key) {
+                        event_id
+                    } else {
+                        resp.id.as_str().map(str::to_owned).ok_or_else(|| {
+                            crate::core::error::Error::Validation(
 							"rmcp server response id has no known correlation mapping and is not a string event id"
 								.to_string(),
 						)
-					})?
-				};
+                        })?
+                    };
 
-				self.transport
-					.send_response(&event_id, JsonRpcMessage::Response(resp))
-					.await
-			}
-			JsonRpcMessage::ErrorResponse(resp) => {
-				let request_key = serde_json::to_string(&resp.id).map_err(|e| {
-					crate::core::error::Error::Validation(format!(
-						"failed to serialize rmcp error response id for correlation lookup: {e}"
-					))
-				})?;
+                self.transport
+                    .send_response(&event_id, JsonRpcMessage::Response(resp))
+                    .await
+            }
+            JsonRpcMessage::ErrorResponse(resp) => {
+                let request_key = serde_json::to_string(&resp.id).map_err(|e| {
+                    crate::core::error::Error::Validation(format!(
+                        "failed to serialize rmcp error response id for correlation lookup: {e}"
+                    ))
+                })?;
 
-				let event_id = if let Some(event_id) = self.request_id_to_event_id.remove(&request_key) {
-					event_id
-				} else {
-					resp.id.as_str().map(str::to_owned).ok_or_else(|| {
-						crate::core::error::Error::Validation(
+                let event_id =
+                    if let Some(event_id) = self.request_id_to_event_id.remove(&request_key) {
+                        event_id
+                    } else {
+                        resp.id.as_str().map(str::to_owned).ok_or_else(|| {
+                            crate::core::error::Error::Validation(
 							"rmcp server error response id has no known correlation mapping and is not a string event id"
 								.to_string(),
 						)
-					})?
-				};
+                        })?
+                    };
 
-				self.transport
-					.send_response(&event_id, JsonRpcMessage::ErrorResponse(resp))
-					.await
-			}
-			JsonRpcMessage::Notification(notification) => {
-				let target = self.active_client_pubkey.as_deref().ok_or_else(|| {
-					crate::core::error::Error::Validation(
-						"cannot forward rmcp server notification: no active client bound"
-							.to_string(),
-					)
-				})?;
-				let message = JsonRpcMessage::Notification(notification);
-				self.transport.send_notification(target, &message, None).await
-			}
-			JsonRpcMessage::Request(request) => {
-				let target = self.active_client_pubkey.as_deref().ok_or_else(|| {
-					crate::core::error::Error::Validation(
-						"cannot forward rmcp server request: no active client bound".to_string(),
-					)
-				})?;
-				let message = JsonRpcMessage::Request(request);
-				self.transport.send_notification(target, &message, None).await
-			}
-		}
-	}
+                self.transport
+                    .send_response(&event_id, JsonRpcMessage::ErrorResponse(resp))
+                    .await
+            }
+            JsonRpcMessage::Notification(notification) => {
+                let target = self.active_client_pubkey.as_deref().ok_or_else(|| {
+                    crate::core::error::Error::Validation(
+                        "cannot forward rmcp server notification: no active client bound"
+                            .to_string(),
+                    )
+                })?;
+                let message = JsonRpcMessage::Notification(notification);
+                self.transport
+                    .send_notification(target, &message, None)
+                    .await
+            }
+            JsonRpcMessage::Request(request) => {
+                let target = self.active_client_pubkey.as_deref().ok_or_else(|| {
+                    crate::core::error::Error::Validation(
+                        "cannot forward rmcp server request: no active client bound".to_string(),
+                    )
+                })?;
+                let message = JsonRpcMessage::Request(request);
+                self.transport
+                    .send_notification(target, &message, None)
+                    .await
+            }
+        }
+    }
 }

@@ -50,7 +50,7 @@ pub fn get_tag_value_from_slice(tags: &[Tag], name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{JsonRpcRequest, JsonRpcMessage};
+    use crate::core::types::{JsonRpcMessage, JsonRpcRequest};
 
     #[test]
     fn test_roundtrip() {

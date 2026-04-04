@@ -53,8 +53,7 @@ async fn main() -> contextvm_sdk::Result<()> {
             println!("  Resources: {} found", resources.len());
         }
 
-        let prompts =
-            discovery::discover_prompts(client, &server.pubkey_parsed, &relays).await?;
+        let prompts = discovery::discover_prompts(client, &server.pubkey_parsed, &relays).await?;
         if !prompts.is_empty() {
             println!("  Prompts: {} found", prompts.len());
         }
