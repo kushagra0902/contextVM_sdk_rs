@@ -18,6 +18,9 @@ use crate::core::types::*;
 use crate::encryption;
 use crate::relay::RelayPool;
 use crate::transport::base::BaseTransport;
+use crate::util::logger;
+
+const LOG_TARGET: &str = "contextvm_sdk::transport::server";
 
 /// Configuration for the server transport.
 pub struct NostrServerTransportConfig {
@@ -37,6 +40,8 @@ pub struct NostrServerTransportConfig {
     pub cleanup_interval: Duration,
     /// Session timeout (default: 300s).
     pub session_timeout: Duration,
+    /// Optional log file path used by all SDK modules.
+    pub log_file_path: Option<String>,
 }
 
 impl Default for NostrServerTransportConfig {
@@ -50,6 +55,7 @@ impl Default for NostrServerTransportConfig {
             excluded_capabilities: Vec::new(),
             cleanup_interval: Duration::from_secs(60),
             session_timeout: Duration::from_secs(300),
+            log_file_path: None,
         }
     }
 }
@@ -86,9 +92,26 @@ impl NostrServerTransport {
     where
         T: IntoNostrSigner,
     {
-        let relay_pool = Arc::new(RelayPool::new(signer).await?);
+        logger::set_global_log_file_path(config.log_file_path.clone());
+
+        let relay_pool = Arc::new(RelayPool::new(signer).await.map_err(|error| {
+            logger::error_with_target(
+                LOG_TARGET,
+                format!("Failed to initialize relay pool for server transport: {error}"),
+            );
+            error
+        })?);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+        logger::info_with_target(
+            LOG_TARGET,
+            format!(
+                "Created server transport; relay_count={}; announced={}; encryption_mode={:?}",
+                config.relay_urls.len(),
+                config.is_announced_server,
+                config.encryption_mode,
+            ),
+        );
         Ok(Self {
             base: BaseTransport {
                 relay_pool,
@@ -105,12 +128,42 @@ impl NostrServerTransport {
 
     /// Start listening for incoming requests.
     pub async fn start(&mut self) -> Result<()> {
-        self.base.connect(&self.config.relay_urls).await?;
+        self.base
+            .connect(&self.config.relay_urls)
+            .await
+            .map_err(|error| {
+                logger::error_with_target(
+                    LOG_TARGET,
+                    format!("Failed to connect server transport to relays: {error}"),
+                );
+                error
+            })?;
 
-        let pubkey = self.base.get_public_key().await?;
-        tracing::info!(pubkey = %pubkey.to_hex(), "Server transport started");
+        let pubkey = self.base.get_public_key().await.map_err(|error| {
+            logger::error_with_target(
+                LOG_TARGET,
+                format!("Failed to fetch server transport public key: {error}"),
+            );
+            error
+        })?;
+        logger::info_with_target(
+            LOG_TARGET,
+            format!("Server transport started; pubkey={}", pubkey.to_hex()),
+        );
 
-        self.base.subscribe_for_pubkey(&pubkey).await?;
+        self.base
+            .subscribe_for_pubkey(&pubkey)
+            .await
+            .map_err(|error| {
+                logger::error_with_target(
+                    LOG_TARGET,
+                    format!(
+                        "Failed to subscribe server transport for pubkey {}: {error}",
+                        pubkey.to_hex(),
+                    ),
+                );
+                error
+            })?;
 
         // Spawn event loop
         let client = self.base.relay_pool.client().clone();
@@ -151,11 +204,23 @@ impl NostrServerTransport {
                 )
                 .await;
                 if cleaned > 0 {
-                    tracing::info!(cleaned, "Cleaned up inactive sessions");
+                    logger::info_with_target(
+                        LOG_TARGET,
+                        format!("Cleaned up inactive sessions; cleaned={cleaned}"),
+                    );
                 }
             }
         });
 
+        logger::info_with_target(
+            LOG_TARGET,
+            format!(
+                "Server transport loops spawned; relay_count={}; cleanup_interval_secs={}; session_timeout_secs={}",
+                self.config.relay_urls.len(),
+                self.config.cleanup_interval.as_secs(),
+                self.config.session_timeout.as_secs(),
+            ),
+        );
         Ok(())
     }
 
@@ -172,14 +237,24 @@ impl NostrServerTransport {
         let event_to_client = self.event_to_client.read().await;
         let client_pubkey_hex = event_to_client
             .get(event_id)
-            .ok_or_else(|| Error::Other(format!("No client found for event {event_id}")))?
+            .ok_or_else(|| {
+                logger::error_with_target(
+                    LOG_TARGET,
+                    format!("No client found for response correlation; event_id={event_id}"),
+                );
+                Error::Other(format!("No client found for event {event_id}"))
+            })?
             .clone();
         drop(event_to_client);
 
         let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(&client_pubkey_hex)
-            .ok_or_else(|| Error::Other(format!("No session for client {client_pubkey_hex}")))?;
+        let session = sessions.get(&client_pubkey_hex).ok_or_else(|| {
+            logger::error_with_target(
+                LOG_TARGET,
+                format!("No session for correlated client; client_pubkey={client_pubkey_hex}"),
+            );
+            Error::Other(format!("No session for client {client_pubkey_hex}"))
+        })?;
 
         // Restore original request ID
         if let Some(original_id) = session.pending_requests.get(event_id) {
@@ -193,11 +268,23 @@ impl NostrServerTransport {
         let is_encrypted = session.is_encrypted;
         drop(sessions);
 
-        let client_pubkey =
-            PublicKey::from_hex(&client_pubkey_hex).map_err(|e| Error::Other(e.to_string()))?;
+        let client_pubkey = PublicKey::from_hex(&client_pubkey_hex).map_err(|e| {
+            logger::error_with_target(
+                LOG_TARGET,
+                format!(
+                    "Invalid client pubkey in session map; pubkey={client_pubkey_hex}; error={e}"
+                ),
+            );
+            Error::Other(e.to_string())
+        })?;
 
-        let event_id_parsed =
-            EventId::from_hex(event_id).map_err(|e| Error::Other(e.to_string()))?;
+        let event_id_parsed = EventId::from_hex(event_id).map_err(|e| {
+            logger::error_with_target(
+                LOG_TARGET,
+                format!("Invalid event id while sending response; event_id={event_id}; error={e}"),
+            );
+            Error::Other(e.to_string())
+        })?;
 
         let tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
 
@@ -209,7 +296,16 @@ impl NostrServerTransport {
                 tags,
                 Some(is_encrypted),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                logger::error_with_target(
+                    LOG_TARGET,
+                    format!(
+                        "Failed to publish response message; client_pubkey={client_pubkey_hex}; event_id={event_id}; error={error}",
+                    ),
+                );
+                error
+            })?;
 
         // Clean up
         let mut sessions = self.sessions.write().await;
@@ -224,6 +320,12 @@ impl NostrServerTransport {
 
         self.event_to_client.write().await.remove(event_id);
 
+        logger::debug_with_target(
+            LOG_TARGET,
+            format!(
+                "Sent server response and cleaned correlation state; client_pubkey={client_pubkey_hex}; event_id={event_id}; encrypted={is_encrypted}",
+            ),
+        );
         Ok(())
     }
 
@@ -275,7 +377,10 @@ impl NostrServerTransport {
 
         for pubkey in initialized {
             if let Err(e) = self.send_notification(&pubkey, notification, None).await {
-                tracing::error!(client = %pubkey, "Failed to send notification: {e}");
+                logger::error_with_target(
+                    LOG_TARGET,
+                    format!("Failed to send notification; client={pubkey}; error={e}"),
+                );
             }
         }
         Ok(())
@@ -489,14 +594,20 @@ impl NostrServerTransport {
                     || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
                 {
                     if encryption_mode == EncryptionMode::Disabled {
-                        tracing::warn!("Received encrypted message but encryption is disabled");
+                        logger::warn_with_target(
+                            LOG_TARGET,
+                            "Received encrypted message but encryption is disabled",
+                        );
                         continue;
                     }
                     // Single-layer NIP-44 decrypt (matches JS/TS SDK)
                     let signer = match client.signer().await {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::error!("Failed to get signer: {e}");
+                            logger::error_with_target(
+                                LOG_TARGET,
+                                format!("Failed to get signer: {e}"),
+                            );
                             continue;
                         }
                     };
@@ -513,21 +624,30 @@ impl NostrServerTransport {
                                     true,
                                 ),
                                 Err(e) => {
-                                    tracing::error!("Failed to parse inner event: {e}");
+                                    logger::error_with_target(
+                                        LOG_TARGET,
+                                        format!("Failed to parse inner event: {e}"),
+                                    );
                                     continue;
                                 }
                             }
                         }
                         Err(e) => {
-                            tracing::error!("Failed to decrypt: {e}");
+                            logger::error_with_target(
+                                LOG_TARGET,
+                                format!("Failed to decrypt: {e}"),
+                            );
                             continue;
                         }
                     }
                 } else {
                     if encryption_mode == EncryptionMode::Required {
-                        tracing::warn!(
-                            pubkey = %event.pubkey,
-                            "Received unencrypted message but encryption is required"
+                        logger::warn_with_target(
+                            LOG_TARGET,
+                            format!(
+                                "Received unencrypted message but encryption is required; pubkey={}",
+                                event.pubkey,
+                            ),
                         );
                         continue;
                     }
@@ -543,7 +663,10 @@ impl NostrServerTransport {
                 let mcp_msg = match serializers::nostr_event_to_mcp_message(&content) {
                     Some(msg) => msg,
                     None => {
-                        tracing::warn!("Invalid MCP message from {sender_pubkey}");
+                        logger::warn_with_target(
+                            LOG_TARGET,
+                            format!("Invalid MCP message from {sender_pubkey}"),
+                        );
                         continue;
                     }
                 };
@@ -564,10 +687,11 @@ impl NostrServerTransport {
                         Self::is_capability_excluded(&excluded_capabilities, method, name);
 
                     if !allowed_pubkeys.contains(&sender_pubkey) && !is_excluded {
-                        tracing::warn!(
-                            pubkey = %sender_pubkey,
-                            method = %method,
-                            "Unauthorized request"
+                        logger::warn_with_target(
+                            LOG_TARGET,
+                            format!(
+                                "Unauthorized request; pubkey={sender_pubkey}; method={method}"
+                            ),
                         );
                         continue;
                     }
@@ -647,7 +771,7 @@ impl NostrServerTransport {
                 for event_id in session.event_to_progress_token.keys() {
                     event_map.remove(event_id);
                 }
-                tracing::debug!(client = %pubkey, "Session expired");
+                logger::debug_with_target(LOG_TARGET, format!("Session expired; client={pubkey}"));
                 cleaned += 1;
                 false
             } else {
@@ -882,5 +1006,6 @@ mod tests {
         assert_eq!(config.cleanup_interval, Duration::from_secs(60));
         assert_eq!(config.session_timeout, Duration::from_secs(300));
         assert!(config.server_info.is_none());
+        assert!(config.log_file_path.is_none());
     }
 }

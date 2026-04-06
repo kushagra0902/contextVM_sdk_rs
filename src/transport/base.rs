@@ -10,6 +10,9 @@ use crate::core::types::{EncryptionMode, JsonRpcMessage};
 use crate::core::validation;
 use crate::encryption;
 use crate::relay::RelayPool;
+use crate::util::logger;
+
+const LOG_TARGET: &str = "contextvm_sdk::transport::base";
 
 /// Shared transport logic for both client and server.
 ///
@@ -88,7 +91,10 @@ impl BaseTransport {
     /// Convert a Nostr event to an MCP message with validation.
     pub fn convert_event_to_mcp(&self, content: &str) -> Option<JsonRpcMessage> {
         if !validation::validate_message_size(content) {
-            tracing::warn!("Message size validation failed: {} bytes", content.len());
+            logger::warn_with_target(
+                LOG_TARGET,
+                format!("Message size validation failed: {} bytes", content.len()),
+            );
             return None;
         }
 
@@ -138,14 +144,19 @@ impl BaseTransport {
             let gift_wrap_event =
                 encryption::gift_wrap_single_layer(&signer, recipient, &event_json).await?;
             self.relay_pool.publish_event(&gift_wrap_event).await?;
-            tracing::debug!(
-                signed_event_id = %signed_event_id,
-                envelope_id = %gift_wrap_event.id,
-                "Sent encrypted MCP message"
+            logger::debug_with_target(
+                LOG_TARGET,
+                format!(
+                    "Sent encrypted MCP message; signed_event_id={signed_event_id}; envelope_id={}",
+                    gift_wrap_event.id
+                ),
             );
         } else {
             self.relay_pool.publish_event(&event).await?;
-            tracing::debug!(signed_event_id = %signed_event_id, "Sent unencrypted MCP message");
+            logger::debug_with_target(
+                LOG_TARGET,
+                format!("Sent unencrypted MCP message; signed_event_id={signed_event_id}"),
+            );
         }
 
         Ok(signed_event_id)

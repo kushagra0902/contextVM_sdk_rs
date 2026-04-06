@@ -7,15 +7,17 @@ use std::collections::HashMap;
 
 use crate::core::error::Result;
 use crate::core::types::JsonRpcMessage;
-use crate::util::logger;
 use crate::transport::client::{NostrClientTransport, NostrClientTransportConfig};
 use crate::transport::server::{NostrServerTransport, NostrServerTransportConfig};
+use crate::util::logger;
 use rmcp::transport::worker::{Worker, WorkerContext, WorkerQuitReason};
 
 use super::convert::{
     internal_to_rmcp_client_rx, internal_to_rmcp_server_rx, rmcp_client_tx_to_internal,
     rmcp_server_tx_to_internal,
 };
+
+const LOG_TARGET: &str = "contextvm_sdk::rmcp_transport::worker";
 
 /// rmcp server worker wrapper for ContextVM Nostr server transport.
 pub struct NostrServerWorker {
@@ -32,7 +34,17 @@ impl NostrServerWorker {
     where
         T: nostr_sdk::prelude::IntoNostrSigner,
     {
-        let transport = NostrServerTransport::new(signer, config).await?;
+        let transport = NostrServerTransport::new(signer, config)
+            .await
+            .map_err(|error| {
+                logger::error_with_target(
+                    LOG_TARGET,
+                    format!("Failed to initialize server worker transport: {error}"),
+                );
+                error
+            })?;
+
+        logger::info_with_target(LOG_TARGET, "Initialized rmcp server worker transport");
         Ok(Self {
             transport,
             active_client_pubkey: None,
@@ -51,10 +63,12 @@ impl Worker for NostrServerWorker {
     type Role = rmcp::RoleServer;
 
     fn err_closed() -> Self::Error {
+        logger::warn_with_target(LOG_TARGET, "rmcp server worker channel closed");
         Self::Error::Transport("rmcp worker channel closed".to_string())
     }
 
     fn err_join(e: tokio::task::JoinError) -> Self::Error {
+        logger::error_with_target(LOG_TARGET, format!("rmcp server worker join error: {e}"));
         Self::Error::Other(format!("rmcp worker join error: {e}"))
     }
 
@@ -95,15 +109,21 @@ impl Worker for NostrServerWorker {
 
                     match &self.active_client_pubkey {
                         Some(active) if active != &client_pubkey => {
-                            tracing::warn!(
-                                active_client = %active,
-                                ignored_client = %client_pubkey,
-                                "Ignoring message from second client: rmcp server worker currently supports one active client per worker"
+                            logger::warn_with_target(
+                                LOG_TARGET,
+                                format!(
+                                    "Ignoring message from second client: rmcp server worker currently supports one active client per worker; active_client={active}; ignored_client={client_pubkey}"
+                                ),
                             );
                             continue;
                         }
                         None => {
-                            tracing::info!(client_pubkey = %client_pubkey, "Binding rmcp server worker to first client session");
+                            logger::info_with_target(
+                                LOG_TARGET,
+                                format!(
+                                    "Binding rmcp server worker to first client session; client_pubkey={client_pubkey}"
+                                ),
+                            );
                             self.active_client_pubkey = Some(client_pubkey.clone());
                         }
                         _ => {}
@@ -115,7 +135,10 @@ impl Worker for NostrServerWorker {
                                 self.request_id_to_event_id.insert(request_key, event_id);
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to serialize request id for correlation map: {e}");
+                                logger::warn_with_target(
+                                    LOG_TARGET,
+                                    format!("Failed to serialize request id for correlation map: {e}"),
+                                );
                             }
                         }
                     }
@@ -125,7 +148,10 @@ impl Worker for NostrServerWorker {
                             break reason;
                         }
                     } else {
-                        tracing::warn!("Failed to convert incoming server-side message to rmcp format");
+                        logger::warn_with_target(
+                            LOG_TARGET,
+                            "Failed to convert incoming server-side message to rmcp format",
+                        );
                     }
                 }
                 outbound = context.recv_from_handler() => {
@@ -148,7 +174,10 @@ impl Worker for NostrServerWorker {
         };
 
         if let Err(e) = self.transport.close().await {
-            tracing::warn!("Failed to close server transport cleanly: {e}");
+            logger::warn_with_target(
+                LOG_TARGET,
+                format!("Failed to close server transport cleanly: {e}"),
+            );
         }
 
         Err(quit_reason)
@@ -166,7 +195,16 @@ impl NostrClientWorker {
     where
         T: nostr_sdk::prelude::IntoNostrSigner,
     {
-        let transport = NostrClientTransport::new(signer, config).await?;
+        let transport = NostrClientTransport::new(signer, config)
+            .await
+            .map_err(|error| {
+                logger::error_with_target(
+                    LOG_TARGET,
+                    format!("Failed to initialize client worker transport: {error}"),
+                );
+                error
+            })?;
+        logger::info_with_target(LOG_TARGET, "Initialized rmcp client worker transport");
         Ok(Self { transport })
     }
 
@@ -181,10 +219,12 @@ impl Worker for NostrClientWorker {
     type Role = rmcp::RoleClient;
 
     fn err_closed() -> Self::Error {
+        logger::warn_with_target(LOG_TARGET, "rmcp client worker channel closed");
         Self::Error::Transport("rmcp worker channel closed".to_string())
     }
 
     fn err_join(e: tokio::task::JoinError) -> Self::Error {
+        logger::error_with_target(LOG_TARGET, format!("rmcp client worker join error: {e}"));
         Self::Error::Other(format!("rmcp worker join error: {e}"))
     }
 
@@ -221,7 +261,10 @@ impl Worker for NostrClientWorker {
                             break reason;
                         }
                     } else {
-                        tracing::warn!("Failed to convert incoming client-side message to rmcp format");
+                        logger::warn_with_target(
+                            LOG_TARGET,
+                            "Failed to convert incoming client-side message to rmcp format",
+                        );
                     }
                 }
                 outbound = context.recv_from_handler() => {
@@ -244,7 +287,10 @@ impl Worker for NostrClientWorker {
         };
 
         if let Err(e) = self.transport.close().await {
-            tracing::warn!("Failed to close client transport cleanly: {e}");
+            logger::warn_with_target(
+                LOG_TARGET,
+                format!("Failed to close client transport cleanly: {e}"),
+            );
         }
 
         Err(quit_reason)

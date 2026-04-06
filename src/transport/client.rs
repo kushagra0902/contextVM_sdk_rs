@@ -17,6 +17,9 @@ use crate::core::types::*;
 use crate::encryption;
 use crate::relay::RelayPool;
 use crate::transport::base::BaseTransport;
+use crate::util::logger;
+
+const LOG_TARGET: &str = "contextvm_sdk::transport::client";
 
 /// Configuration for the client transport.
 pub struct NostrClientTransportConfig {
@@ -30,6 +33,8 @@ pub struct NostrClientTransportConfig {
     pub is_stateless: bool,
     /// Response timeout (default: 30s).
     pub timeout: Duration,
+    /// Optional log file path used by all SDK modules.
+    pub log_file_path: Option<String>,
 }
 
 impl Default for NostrClientTransportConfig {
@@ -40,6 +45,7 @@ impl Default for NostrClientTransportConfig {
             encryption_mode: EncryptionMode::Optional,
             is_stateless: false,
             timeout: Duration::from_secs(30),
+            log_file_path: None,
         }
     }
 }
@@ -62,12 +68,31 @@ impl NostrClientTransport {
     where
         T: IntoNostrSigner,
     {
-        let server_pubkey = PublicKey::from_hex(&config.server_pubkey)
-            .map_err(|e| Error::Other(format!("Invalid server pubkey: {e}")))?;
+        logger::set_global_log_file_path(config.log_file_path.clone());
 
-        let relay_pool = Arc::new(RelayPool::new(signer).await?);
+        let server_pubkey = PublicKey::from_hex(&config.server_pubkey).map_err(|e| {
+            logger::error_with_target(LOG_TARGET, format!("Invalid server pubkey: {e}"));
+            Error::Other(format!("Invalid server pubkey: {e}"))
+        })?;
+
+        let relay_pool = Arc::new(RelayPool::new(signer).await.map_err(|error| {
+            logger::error_with_target(
+                LOG_TARGET,
+                format!("Failed to initialize relay pool for client transport: {error}"),
+            );
+            error
+        })?);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+        logger::info_with_target(
+            LOG_TARGET,
+            format!(
+                "Created client transport; relay_count={}; stateless={}; encryption_mode={:?}",
+                config.relay_urls.len(),
+                config.is_stateless,
+                config.encryption_mode,
+            ),
+        );
         Ok(Self {
             base: BaseTransport {
                 relay_pool,
@@ -84,12 +109,42 @@ impl NostrClientTransport {
 
     /// Connect and start listening for responses.
     pub async fn start(&mut self) -> Result<()> {
-        self.base.connect(&self.config.relay_urls).await?;
+        self.base
+            .connect(&self.config.relay_urls)
+            .await
+            .map_err(|error| {
+                logger::error_with_target(
+                    LOG_TARGET,
+                    format!("Failed to connect client transport to relays: {error}"),
+                );
+                error
+            })?;
 
-        let pubkey = self.base.get_public_key().await?;
-        tracing::info!(pubkey = %pubkey.to_hex(), "Client transport started");
+        let pubkey = self.base.get_public_key().await.map_err(|error| {
+            logger::error_with_target(
+                LOG_TARGET,
+                format!("Failed to fetch client transport public key: {error}"),
+            );
+            error
+        })?;
+        logger::info_with_target(
+            LOG_TARGET,
+            format!("Client transport started; pubkey={}", pubkey.to_hex()),
+        );
 
-        self.base.subscribe_for_pubkey(&pubkey).await?;
+        self.base
+            .subscribe_for_pubkey(&pubkey)
+            .await
+            .map_err(|error| {
+                logger::error_with_target(
+                    LOG_TARGET,
+                    format!(
+                        "Failed to subscribe client transport for pubkey {}: {error}",
+                        pubkey.to_hex(),
+                    ),
+                );
+                error
+            })?;
 
         // Spawn event loop
         let client = self.base.relay_pool.client().clone();
@@ -102,6 +157,13 @@ impl NostrClientTransport {
             Self::event_loop(client, pending, server_pubkey, tx, encryption_mode).await;
         });
 
+        logger::info_with_target(
+            LOG_TARGET,
+            format!(
+                "Client transport event loop spawned; relay_count={}",
+                self.config.relay_urls.len(),
+            ),
+        );
         Ok(())
     }
 
@@ -137,7 +199,18 @@ impl NostrClientTransport {
                 tags,
                 None,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                logger::error_with_target(
+                    LOG_TARGET,
+                    format!(
+                        "Failed to send client message; server_pubkey={}; method={:?}; error={error}",
+                        self.server_pubkey.to_hex(),
+                        message.method(),
+                    ),
+                );
+                error
+            })?;
 
         if matches!(message, JsonRpcMessage::Request(_)) {
             self.pending_requests
@@ -146,6 +219,14 @@ impl NostrClientTransport {
                 .insert(event_id.to_hex());
         }
 
+        logger::debug_with_target(
+            LOG_TARGET,
+            format!(
+                "Sent client message; event_id={}; method={:?}",
+                event_id.to_hex(),
+                message.method(),
+            ),
+        );
         Ok(())
     }
 
@@ -196,7 +277,10 @@ impl NostrClientTransport {
                     let signer = match client.signer().await {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::error!("Failed to get signer: {e}");
+                            logger::error_with_target(
+                                LOG_TARGET,
+                                format!("Failed to get signer: {e}"),
+                            );
                             continue;
                         }
                     };
@@ -208,13 +292,19 @@ impl NostrClientTransport {
                                     (inner.content, inner.pubkey, e_tag)
                                 }
                                 Err(e) => {
-                                    tracing::error!("Failed to parse inner event: {e}");
+                                    logger::error_with_target(
+                                        LOG_TARGET,
+                                        format!("Failed to parse inner event: {e}"),
+                                    );
                                     continue;
                                 }
                             }
                         }
                         Err(e) => {
-                            tracing::error!("Failed to decrypt gift wrap: {e}");
+                            logger::error_with_target(
+                                LOG_TARGET,
+                                format!("Failed to decrypt gift wrap: {e}"),
+                            );
                             continue;
                         }
                     }
@@ -225,7 +315,7 @@ impl NostrClientTransport {
 
                 // Verify it's from our server
                 if actual_pubkey != server_pubkey {
-                    tracing::debug!("Skipping event from unexpected pubkey");
+                    logger::debug_with_target(LOG_TARGET, "Skipping event from unexpected pubkey");
                     continue;
                 }
 
@@ -233,7 +323,10 @@ impl NostrClientTransport {
                 if let Some(ref correlated_id) = e_tag {
                     let is_pending = pending.read().await.contains(correlated_id.as_str());
                     if !is_pending {
-                        tracing::warn!(e_tag = %correlated_id, "Response for unknown request");
+                        logger::warn_with_target(
+                            LOG_TARGET,
+                            format!("Response for unknown request; e_tag={correlated_id}"),
+                        );
                         continue;
                     }
                 }
@@ -265,6 +358,7 @@ mod tests {
         assert_eq!(config.encryption_mode, EncryptionMode::Optional);
         assert!(!config.is_stateless);
         assert_eq!(config.timeout, Duration::from_secs(30));
+        assert!(config.log_file_path.is_none());
     }
 
     #[test]
