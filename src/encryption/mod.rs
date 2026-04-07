@@ -111,7 +111,7 @@ pub async fn gift_wrap(
 
 #[cfg(test)]
 mod tests {
-    use crate::core::constants::KIND_GIFT_WRAP;
+    use crate::core::constants::GIFT_WRAP_KIND;
 
     use super::*;
 
@@ -153,7 +153,7 @@ mod tests {
             .unwrap();
 
         // Build kind 1059 event
-        let builder = EventBuilder::new(Kind::from(KIND_GIFT_WRAP), encrypted)
+        let builder = EventBuilder::new(Kind::from(GIFT_WRAP_KIND), encrypted)
             .tag(Tag::public_key(*recipient));
 
         let event = builder.sign_with_keys(&ephemeral).unwrap();
