@@ -13,8 +13,8 @@ use tokio::sync::RwLock;
 
 use crate::core::constants::*;
 use crate::core::error::{Error, Result};
-use crate::core::serializers;
 use crate::core::types::*;
+use crate::core::validation;
 use crate::encryption;
 use crate::relay::RelayPool;
 use crate::transport::base::BaseTransport;
@@ -548,7 +548,7 @@ impl NostrServerTransport {
                 };
 
                 // Parse MCP message
-                let mcp_msg = match serializers::nostr_event_to_mcp_message(&content) {
+                let mcp_msg = match validation::validate_and_parse(&content) {
                     Some(msg) => msg,
                     None => {
                         tracing::warn!("Invalid MCP message from {sender_pubkey}");

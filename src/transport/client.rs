@@ -14,6 +14,7 @@ use crate::core::constants::*;
 use crate::core::error::{Error, Result};
 use crate::core::serializers;
 use crate::core::types::*;
+use crate::core::validation;
 use crate::encryption;
 use crate::relay::RelayPool;
 use crate::transport::base::BaseTransport;
@@ -244,7 +245,7 @@ impl NostrClientTransport {
 
                 // Parse MCP message
                 if let Some(mcp_msg) =
-                    serializers::nostr_event_to_mcp_message(&actual_event_content)
+                    validation::validate_and_parse(&actual_event_content)
                 {
                     // Clean up pending request
                     if let Some(ref correlated_id) = e_tag {
