@@ -1,8 +1,4 @@
-//! Conformance tests for stateless mode behavior in client transport.
-//!
-//! These mirror the TypeScript SDK StatelessModeHandler expectations at the
-//! transport boundary: initialize requests are handled locally with an emulated
-//! response, while unrelated methods are not handled statelessly.
+//! Stateless-mode conformance tests for the client transport.
 
 use std::time::Duration;
 
