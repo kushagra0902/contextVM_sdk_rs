@@ -3,13 +3,9 @@
 use std::time::Duration;
 
 use contextvm_sdk::core::constants::{mcp_protocol_version, INITIALIZE_METHOD};
-use contextvm_sdk::core::types::{
-    EncryptionMode, JsonRpcMessage, JsonRpcRequest,
-};
-use contextvm_sdk::transport::client::{
-    NostrClientTransport, NostrClientTransportConfig,
-};
+use contextvm_sdk::core::types::{EncryptionMode, JsonRpcMessage, JsonRpcRequest};
 use contextvm_sdk::signer;
+use contextvm_sdk::transport::client::{NostrClientTransport, NostrClientTransportConfig};
 use tokio::time::timeout;
 
 async fn make_stateless_transport() -> (
@@ -25,6 +21,7 @@ async fn make_stateless_transport() -> (
         encryption_mode: EncryptionMode::Optional,
         is_stateless: true,
         timeout: Duration::from_secs(1),
+        log_file_path: None,
     };
 
     let mut transport = NostrClientTransport::new(client_keys, config)
@@ -171,5 +168,4 @@ async fn should_handle_statelessly_returns_false_for_other_methods() {
         recv_result.is_err(),
         "non-initialize request should not create a local emulated response"
     );
-
 }
