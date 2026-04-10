@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::core::constants::{EPHEMERAL_GIFT_WRAP_KIND, GIFT_WRAP_KIND};
+
 // ── Encryption mode ─────────────────────────────────────────────────
 
 /// Encryption mode for transport communication.
@@ -20,6 +22,35 @@ pub enum EncryptionMode {
     Required,
     /// Disable encryption entirely; all messages are plaintext kind 25910.
     Disabled,
+}
+
+/// Gift-wrap policy for encrypted transport communication.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GiftWrapMode {
+    /// Prefer persistent gift wraps until ephemeral support is explicitly chosen or learned.
+    #[default]
+    Optional,
+    /// Force the ephemeral gift-wrap kind (`21059`) for encrypted messages.
+    Ephemeral,
+    /// Force the persistent gift-wrap kind (`1059`) for encrypted messages.
+    Persistent,
+}
+
+impl GiftWrapMode {
+    /// Returns whether this mode accepts the given encrypted outer event kind.
+    pub fn allows_kind(self, kind: u16) -> bool {
+        match self {
+            Self::Optional => kind == GIFT_WRAP_KIND || kind == EPHEMERAL_GIFT_WRAP_KIND,
+            Self::Ephemeral => kind == EPHEMERAL_GIFT_WRAP_KIND,
+            Self::Persistent => kind == GIFT_WRAP_KIND,
+        }
+    }
+
+    /// Returns whether this mode supports sending and advertising ephemeral gift wraps.
+    pub fn supports_ephemeral(self) -> bool {
+        !matches!(self, Self::Persistent)
+    }
 }
 
 // ── Server info ─────────────────────────────────────────────────────
@@ -54,14 +85,27 @@ pub struct ServerInfo {
 pub struct ClientSession {
     /// Whether the client has completed MCP initialization.
     pub is_initialized: bool,
+    /// Whether common discovery tags have already been attached to a response for this session.
+    pub has_sent_common_tags: bool,
     /// Whether the client's messages were encrypted.
     pub is_encrypted: bool,
     /// Last activity timestamp.
     pub last_activity: Instant,
-    /// Pending requests: event_id → original request ID.
-    pub pending_requests: HashMap<String, serde_json::Value>,
-    /// Progress token tracking: event_id → progress token string.
-    pub event_to_progress_token: HashMap<String, String>,
+    /// Pending routes: event_id -> route metadata.
+    pub pending_requests: HashMap<String, PendingRequestRoute>,
+    /// Progress token tracking: progress_token -> event_id.
+    pub progress_token_to_event: HashMap<String, String>,
+}
+
+/// Route metadata for an in-flight request/response pair.
+#[derive(Debug, Clone)]
+pub struct PendingRequestRoute {
+    /// The original JSON-RPC request ID prior to transport correlation rewriting.
+    pub original_request_id: serde_json::Value,
+    /// Optional progress token associated with this request.
+    pub progress_token: Option<String>,
+    /// Gift-wrap kind used by the correlated request, if encrypted.
+    pub wrap_kind: Option<u16>,
 }
 
 impl ClientSession {
@@ -69,10 +113,11 @@ impl ClientSession {
     pub fn new(is_encrypted: bool) -> Self {
         Self {
             is_initialized: false,
+            has_sent_common_tags: false,
             is_encrypted,
             last_activity: Instant::now(),
             pending_requests: HashMap::new(),
-            event_to_progress_token: HashMap::new(),
+            progress_token_to_event: HashMap::new(),
         }
     }
 
@@ -255,6 +300,46 @@ mod tests {
         assert_eq!(s, "\"disabled\"");
         let parsed: EncryptionMode = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_gift_wrap_mode_serde_roundtrip_optional() {
+        let mode = GiftWrapMode::Optional;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"optional\"");
+        let parsed: GiftWrapMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_gift_wrap_mode_serde_roundtrip_ephemeral() {
+        let mode = GiftWrapMode::Ephemeral;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"ephemeral\"");
+        let parsed: GiftWrapMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_gift_wrap_mode_serde_roundtrip_persistent() {
+        let mode = GiftWrapMode::Persistent;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"persistent\"");
+        let parsed: GiftWrapMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_gift_wrap_mode_policy_helpers() {
+        assert!(GiftWrapMode::Optional.allows_kind(GIFT_WRAP_KIND));
+        assert!(GiftWrapMode::Optional.allows_kind(EPHEMERAL_GIFT_WRAP_KIND));
+        assert!(GiftWrapMode::Ephemeral.allows_kind(EPHEMERAL_GIFT_WRAP_KIND));
+        assert!(!GiftWrapMode::Ephemeral.allows_kind(GIFT_WRAP_KIND));
+        assert!(GiftWrapMode::Persistent.allows_kind(GIFT_WRAP_KIND));
+        assert!(!GiftWrapMode::Persistent.allows_kind(EPHEMERAL_GIFT_WRAP_KIND));
+        assert!(GiftWrapMode::Optional.supports_ephemeral());
+        assert!(GiftWrapMode::Ephemeral.supports_ephemeral());
+        assert!(!GiftWrapMode::Persistent.supports_ephemeral());
     }
 
     fn assert_json_rpc_roundtrip(msg: &JsonRpcMessage) {
@@ -474,18 +559,20 @@ mod tests {
     fn test_client_session_new_initial_state_encrypted() {
         let session = ClientSession::new(true);
         assert!(!session.is_initialized);
+        assert!(!session.has_sent_common_tags);
         assert!(session.is_encrypted);
         assert!(session.pending_requests.is_empty());
-        assert!(session.event_to_progress_token.is_empty());
+        assert!(session.progress_token_to_event.is_empty());
     }
 
     #[test]
     fn test_client_session_new_initial_state_plaintext() {
         let session = ClientSession::new(false);
         assert!(!session.is_initialized);
+        assert!(!session.has_sent_common_tags);
         assert!(!session.is_encrypted);
         assert!(session.pending_requests.is_empty());
-        assert!(session.event_to_progress_token.is_empty());
+        assert!(session.progress_token_to_event.is_empty());
     }
 
     #[test]
