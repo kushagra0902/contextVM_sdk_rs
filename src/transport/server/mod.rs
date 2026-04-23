@@ -4,6 +4,10 @@
 //! sessions, handles request/response correlation, and optionally publishes
 //! server announcements.
 
+pub mod correlation_store;
+
+pub use correlation_store::ServerEventRouteStore;
+
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -70,7 +74,7 @@ pub struct NostrServerTransport {
     /// Client sessions: client_pubkey_hex → ClientSession
     sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
     /// Reverse lookup: event_id → client_pubkey_hex
-    event_to_client: Arc<RwLock<HashMap<String, String>>>,
+    event_routes: ServerEventRouteStore,
     /// Outer gift-wrap event IDs successfully decrypted and verified (inner `verify()`).
     /// Duplicate outer ids are skipped before decrypt; ids are inserted only after success
     /// so failed decrypt/verify can be retried on redelivery.
@@ -130,7 +134,7 @@ impl NostrServerTransport {
             },
             config,
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            event_to_client: Arc::new(RwLock::new(HashMap::new())),
+            event_routes: ServerEventRouteStore::new(),
             seen_gift_wrap_ids,
             message_tx: tx,
             message_rx: Some(rx),
@@ -181,7 +185,7 @@ impl NostrServerTransport {
         // Spawn event loop
         let relay_pool = Arc::clone(&self.base.relay_pool);
         let sessions = self.sessions.clone();
-        let event_to_client = self.event_to_client.clone();
+        let event_routes = self.event_routes.clone();
         let tx = self.message_tx.clone();
         let allowed = self.config.allowed_public_keys.clone();
         let excluded = self.config.excluded_capabilities.clone();
@@ -192,7 +196,7 @@ impl NostrServerTransport {
             Self::event_loop(
                 relay_pool,
                 sessions,
-                event_to_client,
+                event_routes,
                 tx,
                 allowed,
                 excluded,
@@ -204,7 +208,7 @@ impl NostrServerTransport {
 
         // Spawn session cleanup
         let sessions_cleanup = self.sessions.clone();
-        let event_to_client_cleanup = self.event_to_client.clone();
+        let event_routes_cleanup = self.event_routes.clone();
         let cleanup_interval = self.config.cleanup_interval;
         let session_timeout = self.config.session_timeout;
 
@@ -214,7 +218,7 @@ impl NostrServerTransport {
                 interval.tick().await;
                 let cleaned = Self::cleanup_sessions(
                     &sessions_cleanup,
-                    &event_to_client_cleanup,
+                    &event_routes_cleanup,
                     session_timeout,
                 )
                 .await;
@@ -242,25 +246,20 @@ impl NostrServerTransport {
     pub async fn close(&mut self) -> Result<()> {
         self.base.disconnect().await?;
         self.sessions.write().await.clear();
-        self.event_to_client.write().await.clear();
+        self.event_routes.clear().await;
         Ok(())
     }
 
     /// Send a response back to the client that sent the original request.
     pub async fn send_response(&self, event_id: &str, mut response: JsonRpcMessage) -> Result<()> {
-        let event_to_client = self.event_to_client.read().await;
-        let client_pubkey_hex = event_to_client
-            .get(event_id)
-            .ok_or_else(|| {
-                tracing::error!(
-                    target: LOG_TARGET,
-                    event_id = %event_id,
-                    "No client found for response correlation"
-                );
-                Error::Other(format!("No client found for event {event_id}"))
-            })?
-            .clone();
-        drop(event_to_client);
+        let client_pubkey_hex = self.event_routes.get(event_id).await.ok_or_else(|| {
+            tracing::error!(
+                target: LOG_TARGET,
+                event_id = %event_id,
+                "No client found for response correlation"
+            );
+            Error::Other(format!("No client found for event {event_id}"))
+        })?;
 
         let sessions = self.sessions.read().await;
         let session = sessions.get(&client_pubkey_hex).ok_or_else(|| {
@@ -326,7 +325,9 @@ impl NostrServerTransport {
                 error
             })?;
 
-        // Clean up
+        // Clean up only after successful send
+        self.event_routes.pop(event_id).await;
+
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(&client_pubkey_hex) {
             // Clean up progress token
@@ -336,8 +337,6 @@ impl NostrServerTransport {
             session.pending_requests.remove(event_id);
         }
         drop(sessions);
-
-        self.event_to_client.write().await.remove(event_id);
 
         tracing::debug!(
             target: LOG_TARGET,
@@ -602,7 +601,7 @@ impl NostrServerTransport {
     async fn event_loop(
         relay_pool: Arc<dyn RelayPoolTrait>,
         sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
-        event_to_client: Arc<RwLock<HashMap<String, String>>>,
+        event_routes: ServerEventRouteStore,
         tx: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
         allowed_pubkeys: Vec<String>,
         excluded_capabilities: Vec<CapabilityExclusion>,
@@ -768,10 +767,9 @@ impl NostrServerTransport {
                     session
                         .pending_requests
                         .insert(event_id.clone(), original_id);
-                    event_to_client
-                        .write()
-                        .await
-                        .insert(event_id.clone(), sender_pubkey.clone());
+                    event_routes
+                        .register(event_id.clone(), sender_pubkey.clone())
+                        .await;
 
                     // Track progress token
                     if let Some(token) = req
@@ -812,22 +810,17 @@ impl NostrServerTransport {
 
     async fn cleanup_sessions(
         sessions: &RwLock<HashMap<String, ClientSession>>,
-        event_to_client: &RwLock<HashMap<String, String>>,
+        event_routes: &ServerEventRouteStore,
         timeout: Duration,
     ) -> usize {
         let mut sessions_w = sessions.write().await;
-        let mut event_map = event_to_client.write().await;
         let mut cleaned = 0;
+        let mut stale_event_ids = Vec::new();
 
         sessions_w.retain(|pubkey, session| {
             if session.last_activity.elapsed() > timeout {
-                // Clean up reverse mappings
-                for event_id in session.pending_requests.keys() {
-                    event_map.remove(event_id);
-                }
-                for event_id in session.event_to_progress_token.keys() {
-                    event_map.remove(event_id);
-                }
+                stale_event_ids.extend(session.pending_requests.keys().cloned());
+                stale_event_ids.extend(session.event_to_progress_token.keys().cloned());
                 tracing::debug!(
                     target: LOG_TARGET,
                     client_pubkey = %pubkey,
@@ -839,6 +832,11 @@ impl NostrServerTransport {
                 true
             }
         });
+        drop(sessions_w);
+
+        for event_id in &stale_event_ids {
+            event_routes.pop(event_id).await;
+        }
 
         cleaned
     }
@@ -872,7 +870,7 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_sessions_removes_expired() {
         let sessions = Arc::new(RwLock::new(HashMap::new()));
-        let event_to_client = Arc::new(RwLock::new(HashMap::new()));
+        let event_routes = ServerEventRouteStore::new();
 
         // Insert a session with an old activity time
         let mut session = ClientSession::new(false);
@@ -883,15 +881,14 @@ mod tests {
             .write()
             .await
             .insert("pubkey1".to_string(), session);
-        event_to_client
-            .write()
-            .await
-            .insert("evt1".to_string(), "pubkey1".to_string());
+        event_routes
+            .register("evt1".to_string(), "pubkey1".to_string())
+            .await;
 
         // With a long timeout, nothing should be cleaned
         let cleaned = NostrServerTransport::cleanup_sessions(
             &sessions,
-            &event_to_client,
+            &event_routes,
             Duration::from_secs(300),
         )
         .await;
@@ -902,26 +899,26 @@ mod tests {
         thread::sleep(Duration::from_millis(5));
         let cleaned = NostrServerTransport::cleanup_sessions(
             &sessions,
-            &event_to_client,
+            &event_routes,
             Duration::from_millis(1),
         )
         .await;
         assert_eq!(cleaned, 1);
         assert!(sessions.read().await.is_empty());
-        assert!(event_to_client.read().await.is_empty());
+        assert!(event_routes.pop("evt1").await.is_none());
     }
 
     #[tokio::test]
     async fn test_cleanup_preserves_active_sessions() {
         let sessions = Arc::new(RwLock::new(HashMap::new()));
-        let event_to_client = Arc::new(RwLock::new(HashMap::new()));
+        let event_routes = ServerEventRouteStore::new();
 
         let session = ClientSession::new(false);
         sessions.write().await.insert("active".to_string(), session);
 
         let cleaned = NostrServerTransport::cleanup_sessions(
             &sessions,
-            &event_to_client,
+            &event_routes,
             Duration::from_secs(300),
         )
         .await;

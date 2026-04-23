@@ -3,14 +3,16 @@
 //! Connects to a remote MCP server over Nostr. Sends JSON-RPC requests as
 //! kind 25910 events, correlates responses via `e` tag.
 
-use std::collections::HashSet;
+pub mod correlation_store;
+
+pub use correlation_store::ClientCorrelationStore;
+
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lru::LruCache;
 use nostr_sdk::prelude::*;
-use tokio::sync::RwLock;
 
 use crate::core::constants::*;
 use crate::core::error::{Error, Result};
@@ -60,7 +62,7 @@ pub struct NostrClientTransport {
     config: NostrClientTransportConfig,
     server_pubkey: PublicKey,
     /// Pending request event IDs awaiting responses.
-    pending_requests: Arc<RwLock<HashSet<String>>>,
+    pending_requests: ClientCorrelationStore,
     /// Outer gift-wrap event IDs successfully decrypted and verified (inner `verify()`).
     /// Duplicate outer ids are skipped before decrypt; ids are inserted only after success
     /// so failed decrypt/verify can be retried on redelivery.
@@ -117,7 +119,7 @@ impl NostrClientTransport {
             },
             config,
             server_pubkey,
-            pending_requests: Arc::new(RwLock::new(HashSet::new())),
+            pending_requests: ClientCorrelationStore::new(),
             seen_gift_wrap_ids,
             message_tx: tx,
             message_rx: Some(rx),
@@ -238,10 +240,7 @@ impl NostrClientTransport {
             })?;
 
         if matches!(message, JsonRpcMessage::Request(_)) {
-            self.pending_requests
-                .write()
-                .await
-                .insert(event_id.to_hex());
+            self.pending_requests.register(event_id.to_hex()).await;
         }
 
         tracing::debug!(
@@ -282,7 +281,7 @@ impl NostrClientTransport {
 
     async fn event_loop(
         relay_pool: Arc<dyn RelayPoolTrait>,
-        pending: Arc<RwLock<HashSet<String>>>,
+        pending: ClientCorrelationStore,
         server_pubkey: PublicKey,
         tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
         encryption_mode: EncryptionMode,
@@ -395,7 +394,7 @@ impl NostrClientTransport {
 
                 // Correlate response
                 if let Some(ref correlated_id) = e_tag {
-                    let is_pending = pending.read().await.contains(correlated_id.as_str());
+                    let is_pending = pending.contains(correlated_id.as_str()).await;
                     if !is_pending {
                         tracing::warn!(
                             target: LOG_TARGET,
@@ -410,7 +409,7 @@ impl NostrClientTransport {
                 if let Some(mcp_msg) = validation::validate_and_parse(&actual_event_content) {
                     // Clean up pending request
                     if let Some(ref correlated_id) = e_tag {
-                        pending.write().await.remove(correlated_id.as_str());
+                        pending.remove(correlated_id.as_str()).await;
                     }
                     let _ = tx.send(mcp_msg);
                 }

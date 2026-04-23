@@ -7,5 +7,5 @@ pub mod base;
 pub mod client;
 pub mod server;
 
-pub use client::{NostrClientTransport, NostrClientTransportConfig};
-pub use server::{NostrServerTransport, NostrServerTransportConfig};
+pub use client::{ClientCorrelationStore, NostrClientTransport, NostrClientTransportConfig};
+pub use server::{NostrServerTransport, NostrServerTransportConfig, ServerEventRouteStore};

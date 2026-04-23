@@ -57,8 +57,12 @@ pub use core::types::{
 };
 pub use discovery::ServerAnnouncement;
 pub use relay::RelayPool;
-pub use transport::client::{NostrClientTransport, NostrClientTransportConfig};
-pub use transport::server::{IncomingRequest, NostrServerTransport, NostrServerTransportConfig};
+pub use transport::client::{
+    ClientCorrelationStore, NostrClientTransport, NostrClientTransportConfig,
+};
+pub use transport::server::{
+    IncomingRequest, NostrServerTransport, NostrServerTransportConfig, ServerEventRouteStore,
+};
 
 #[cfg(feature = "rmcp")]
 pub use rmcp;
