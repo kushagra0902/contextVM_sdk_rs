@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +34,8 @@ pub struct NostrClientTransportConfig {
     pub server_pubkey: String,
     /// Encryption mode.
     pub encryption_mode: EncryptionMode,
+    /// Gift-wrap policy for encrypted messages.
+    pub gift_wrap_mode: GiftWrapMode,
     /// Stateless mode: emulate initialize response locally.
     pub is_stateless: bool,
     /// Response timeout (default: 30s).
@@ -47,6 +50,7 @@ impl Default for NostrClientTransportConfig {
             relay_urls: vec!["wss://relay.damus.io".to_string()],
             server_pubkey: String::new(),
             encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
             is_stateless: false,
             timeout: Duration::from_secs(30),
             log_file_path: None,
@@ -61,6 +65,8 @@ pub struct NostrClientTransport {
     server_pubkey: PublicKey,
     /// Pending request event IDs awaiting responses.
     pending_requests: Arc<RwLock<HashSet<String>>>,
+    /// Learned support for server-side ephemeral gift wraps.
+    server_supports_ephemeral: Arc<AtomicBool>,
     /// Outer gift-wrap event IDs successfully decrypted and verified (inner `verify()`).
     /// Duplicate outer ids are skipped before decrypt; ids are inserted only after success
     /// so failed decrypt/verify can be retried on redelivery.
@@ -117,6 +123,7 @@ impl NostrClientTransport {
             config,
             server_pubkey,
             pending_requests: Arc::new(RwLock::new(HashSet::new())),
+            server_supports_ephemeral: Arc::new(AtomicBool::new(false)),
             seen_gift_wrap_ids,
             message_tx: tx,
             message_rx: Some(rx),
@@ -170,6 +177,8 @@ impl NostrClientTransport {
         let server_pubkey = self.server_pubkey;
         let tx = self.message_tx.clone();
         let encryption_mode = self.config.encryption_mode;
+        let gift_wrap_mode = self.config.gift_wrap_mode;
+        let server_supports_ephemeral = self.server_supports_ephemeral.clone();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
 
         tokio::spawn(async move {
@@ -179,6 +188,8 @@ impl NostrClientTransport {
                 server_pubkey,
                 tx,
                 encryption_mode,
+                gift_wrap_mode,
+                server_supports_ephemeral,
                 seen_gift_wrap_ids,
             )
             .await;
@@ -223,6 +234,7 @@ impl NostrClientTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 None,
+                Some(self.choose_outbound_gift_wrap_kind()),
             )
             .await
             .map_err(|error| {
@@ -285,6 +297,8 @@ impl NostrClientTransport {
         server_pubkey: PublicKey,
         tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
         encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+        server_supports_ephemeral: Arc<AtomicBool>,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     ) {
         let mut notifications = client.notifications();
@@ -292,25 +306,42 @@ impl NostrClientTransport {
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
                 let is_gift_wrap = is_gift_wrap_kind(&event.kind);
+                let outer_kind = event.kind.as_u16();
 
-                // Enforce mode before decrypt/parse.
+                // Enforce encryption mode before decrypt/parse.
                 if violates_encryption_policy(&event.kind, &encryption_mode) {
                     if is_gift_wrap {
                         tracing::warn!(
+                            target: LOG_TARGET,
                             event_id = %event.id.to_hex(),
-                            "Received encrypted response but encryption is disabled"
+                            event_kind = outer_kind,
+                            configured_mode = ?gift_wrap_mode,
+                            "Skipping encrypted response because client encryption is disabled"
                         );
                     } else {
                         tracing::warn!(
+                            target: LOG_TARGET,
                             event_id = %event.id.to_hex(),
-                            "Received unencrypted response but encryption is required"
+                            "Skipping plaintext response because client encryption is required"
                         );
                     }
                     continue;
                 }
 
+                // Enforce CEP-19 gift-wrap-mode policy.
+                if is_gift_wrap && !gift_wrap_mode.allows_kind(outer_kind) {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        event_id = %event.id.to_hex(),
+                        event_kind = outer_kind,
+                        configured_mode = ?gift_wrap_mode,
+                        "Skipping gift wrap due to CEP-19 policy"
+                    );
+                    continue;
+                }
+
                 // Handle gift-wrapped events
-                let (actual_event_content, actual_pubkey, e_tag) = if is_gift_wrap {
+                let (actual_event_content, actual_pubkey, e_tag, verified_tags) = if is_gift_wrap {
                     {
                         let guard = match seen_gift_wrap_ids.lock() {
                             Ok(g) => g,
@@ -355,7 +386,7 @@ impl NostrClientTransport {
                                         guard.put(event.id, ());
                                     }
                                     let e_tag = serializers::get_tag_value(&inner.tags, "e");
-                                    (inner.content, inner.pubkey, e_tag)
+                                    (inner.content, inner.pubkey, e_tag, inner.tags)
                                 }
                                 Err(error) => {
                                     tracing::error!(
@@ -378,7 +409,7 @@ impl NostrClientTransport {
                     }
                 } else {
                     let e_tag = serializers::get_tag_value(&event.tags, "e");
-                    (event.content.clone(), event.pubkey, e_tag)
+                    (event.content.clone(), event.pubkey, e_tag, event.tags.clone())
                 };
 
                 // Verify it's from our server
@@ -390,6 +421,16 @@ impl NostrClientTransport {
                         "Skipping event from unexpected pubkey"
                     );
                     continue;
+                }
+
+                // CEP-19: learn ephemeral support from server
+                if Self::should_learn_ephemeral_support(
+                    actual_pubkey,
+                    server_pubkey,
+                    if is_gift_wrap { Some(outer_kind) } else { None },
+                    &verified_tags,
+                ) {
+                    server_supports_ephemeral.store(true, Ordering::Relaxed);
                 }
 
                 // Correlate response
@@ -415,6 +456,45 @@ impl NostrClientTransport {
                 }
             }
         }
+    }
+
+    fn choose_outbound_gift_wrap_kind(&self) -> u16 {
+        match self.config.gift_wrap_mode {
+            GiftWrapMode::Persistent => GIFT_WRAP_KIND,
+            GiftWrapMode::Ephemeral => EPHEMERAL_GIFT_WRAP_KIND,
+            GiftWrapMode::Optional => {
+                if self.server_supports_ephemeral.load(Ordering::Relaxed) {
+                    EPHEMERAL_GIFT_WRAP_KIND
+                } else {
+                    GIFT_WRAP_KIND
+                }
+            }
+        }
+    }
+
+    fn has_support_ephemeral_tag(tags: &Tags) -> bool {
+        tags.iter().any(|tag| {
+            tag.kind()
+                == TagKind::Custom(
+                    crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL.into(),
+                )
+        })
+    }
+
+    fn should_learn_ephemeral_support(
+        actual_pubkey: PublicKey,
+        server_pubkey: PublicKey,
+        event_kind: Option<u16>,
+        tags: &Tags,
+    ) -> bool {
+        actual_pubkey == server_pubkey
+            && (event_kind == Some(EPHEMERAL_GIFT_WRAP_KIND)
+                || Self::has_support_ephemeral_tag(tags))
+    }
+
+    /// Returns whether the client has learned ephemeral gift-wrap support from the server.
+    pub fn server_supports_ephemeral_encryption(&self) -> bool {
+        self.server_supports_ephemeral.load(Ordering::Relaxed)
     }
 }
 
@@ -442,6 +522,7 @@ mod tests {
         assert_eq!(config.relay_urls, vec!["wss://relay.damus.io".to_string()]);
         assert!(config.server_pubkey.is_empty());
         assert_eq!(config.encryption_mode, EncryptionMode::Optional);
+        assert_eq!(config.gift_wrap_mode, GiftWrapMode::Optional);
         assert!(!config.is_stateless);
         assert_eq!(config.timeout, Duration::from_secs(30));
         assert!(config.log_file_path.is_none());
@@ -457,8 +538,77 @@ mod tests {
     }
 
     #[test]
+    fn test_has_support_ephemeral_tag_detects_capability() {
+        let tags = Tags::from_list(vec![Tag::custom(
+            TagKind::Custom(crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+            Vec::<String>::new(),
+        )]);
+        assert!(NostrClientTransport::has_support_ephemeral_tag(&tags));
+    }
+
+    #[test]
+    fn test_has_support_ephemeral_tag_absent() {
+        let tags = Tags::from_list(vec![Tag::custom(
+            TagKind::Custom(crate::core::constants::tags::SUPPORT_ENCRYPTION.into()),
+            Vec::<String>::new(),
+        )]);
+        assert!(!NostrClientTransport::has_support_ephemeral_tag(&tags));
+    }
+
+    #[test]
+    fn test_should_learn_ephemeral_support_requires_matching_server_pubkey() {
+        let server_keys = Keys::generate();
+        let other_keys = Keys::generate();
+        let tags = Tags::from_list(vec![Tag::custom(
+            TagKind::Custom(crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+            Vec::<String>::new(),
+        )]);
+
+        assert!(!NostrClientTransport::should_learn_ephemeral_support(
+            other_keys.public_key(),
+            server_keys.public_key(),
+            Some(EPHEMERAL_GIFT_WRAP_KIND),
+            &tags,
+        ));
+        assert!(NostrClientTransport::should_learn_ephemeral_support(
+            server_keys.public_key(),
+            server_keys.public_key(),
+            Some(EPHEMERAL_GIFT_WRAP_KIND),
+            &tags,
+        ));
+    }
+
+    #[test]
+    fn test_should_learn_from_ephemeral_kind_even_without_tag() {
+        let server_keys = Keys::generate();
+        let empty_tags = Tags::from_list(vec![]);
+
+        assert!(NostrClientTransport::should_learn_ephemeral_support(
+            server_keys.public_key(),
+            server_keys.public_key(),
+            Some(EPHEMERAL_GIFT_WRAP_KIND),
+            &empty_tags,
+        ));
+    }
+
+    #[test]
+    fn test_should_learn_from_tag_without_ephemeral_kind() {
+        let server_keys = Keys::generate();
+        let tags = Tags::from_list(vec![Tag::custom(
+            TagKind::Custom(crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+            Vec::<String>::new(),
+        )]);
+
+        assert!(NostrClientTransport::should_learn_ephemeral_support(
+            server_keys.public_key(),
+            server_keys.public_key(),
+            Some(GIFT_WRAP_KIND), // persistent kind, but tag present
+            &tags,
+        ));
+    }
+
+    #[test]
     fn test_stateless_emulated_initialize_response_shape() {
-        // Verify the emulated response has the expected structure
         let request_id = serde_json::json!(1);
         let response = JsonRpcMessage::Response(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),

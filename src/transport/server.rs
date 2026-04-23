@@ -312,6 +312,7 @@ impl NostrServerTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 Some(is_encrypted),
+                None,
             )
             .await
             .map_err(|error| {
@@ -378,6 +379,7 @@ impl NostrServerTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 Some(is_encrypted),
+                None,
             )
             .await?;
 
