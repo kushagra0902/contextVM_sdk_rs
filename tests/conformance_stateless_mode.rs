@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use contextvm_sdk::core::constants::{mcp_protocol_version, INITIALIZE_METHOD};
-use contextvm_sdk::core::types::{EncryptionMode, JsonRpcMessage, JsonRpcRequest};
+use contextvm_sdk::core::types::{EncryptionMode, GiftWrapMode, JsonRpcMessage, JsonRpcRequest};
 use contextvm_sdk::signer;
 use contextvm_sdk::transport::client::{NostrClientTransport, NostrClientTransportConfig};
 use tokio::time::timeout;
@@ -19,6 +19,7 @@ async fn make_stateless_transport() -> (
         relay_urls: Vec::new(),
         server_pubkey: server_keys.public_key().to_hex(),
         encryption_mode: EncryptionMode::Optional,
+        gift_wrap_mode: GiftWrapMode::Optional,
         is_stateless: true,
         timeout: Duration::from_secs(1),
         log_file_path: None,

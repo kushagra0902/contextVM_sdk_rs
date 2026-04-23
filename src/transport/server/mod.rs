@@ -9,7 +9,9 @@ pub mod session_store;
 
 pub use correlation_store::{RouteEntry, ServerEventRouteStore};
 pub use session_store::{SessionSnapshot, SessionStore};
+use tokio::sync::RwLock;
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,6 +37,8 @@ pub struct NostrServerTransportConfig {
     pub relay_urls: Vec<String>,
     /// Encryption mode.
     pub encryption_mode: EncryptionMode,
+    /// Gift-wrap policy for encrypted messages.
+    pub gift_wrap_mode: GiftWrapMode,
     /// Server information for announcements.
     pub server_info: Option<ServerInfo>,
     /// Whether this server publishes public announcements (CEP-6).
@@ -56,6 +60,7 @@ impl Default for NostrServerTransportConfig {
         Self {
             relay_urls: vec!["wss://relay.damus.io".to_string()],
             encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
             server_info: None,
             is_announced_server: false,
             allowed_public_keys: Vec::new(),
@@ -75,6 +80,8 @@ pub struct NostrServerTransport {
     sessions: SessionStore,
     /// Reverse lookup: event_id → client route.
     event_routes: ServerEventRouteStore,
+    /// CEP-19: Track the incoming gift-wrap kind per request for mirroring.
+    request_wrap_kinds: Arc<RwLock<HashMap<String, Option<u16>>>>,
     /// Outer gift-wrap event IDs successfully decrypted and verified (inner `verify()`).
     /// Duplicate outer ids are skipped before decrypt; ids are inserted only after success
     /// so failed decrypt/verify can be retried on redelivery.
@@ -124,6 +131,7 @@ impl NostrServerTransport {
             relay_count = config.relay_urls.len(),
             announced = config.is_announced_server,
             encryption_mode = ?config.encryption_mode,
+            gift_wrap_mode = ?config.gift_wrap_mode,
             "Created server transport"
         );
         Ok(Self {
@@ -135,6 +143,7 @@ impl NostrServerTransport {
             config,
             sessions: SessionStore::new(),
             event_routes: ServerEventRouteStore::new(),
+            request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             seen_gift_wrap_ids,
             message_tx: tx,
             message_rx: Some(rx),
@@ -168,6 +177,7 @@ impl NostrServerTransport {
             },
             config,
             sessions: SessionStore::new(),
+            request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             event_routes: ServerEventRouteStore::new(),
             seen_gift_wrap_ids,
             message_tx: tx,
@@ -220,10 +230,12 @@ impl NostrServerTransport {
         let relay_pool = Arc::clone(&self.base.relay_pool);
         let sessions = self.sessions.clone();
         let event_routes = self.event_routes.clone();
+        let request_wrap_kinds = self.request_wrap_kinds.clone();
         let tx = self.message_tx.clone();
         let allowed = self.config.allowed_public_keys.clone();
         let excluded = self.config.excluded_capabilities.clone();
         let encryption_mode = self.config.encryption_mode;
+        let gift_wrap_mode = self.config.gift_wrap_mode;
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
 
         tokio::spawn(async move {
@@ -231,10 +243,12 @@ impl NostrServerTransport {
                 relay_pool,
                 sessions,
                 event_routes,
+                request_wrap_kinds,
                 tx,
                 allowed,
                 excluded,
                 encryption_mode,
+                gift_wrap_mode,
                 seen_gift_wrap_ids,
             )
             .await;
@@ -243,6 +257,7 @@ impl NostrServerTransport {
         // Spawn session cleanup
         let sessions_cleanup = self.sessions.clone();
         let event_routes_cleanup = self.event_routes.clone();
+        let request_wrap_kinds_cleanup = self.request_wrap_kinds.clone();
         let cleanup_interval = self.config.cleanup_interval;
         let session_timeout = self.config.session_timeout;
 
@@ -253,6 +268,7 @@ impl NostrServerTransport {
                 let cleaned = Self::cleanup_sessions(
                     &sessions_cleanup,
                     &event_routes_cleanup,
+                    &request_wrap_kinds_cleanup,
                     session_timeout,
                 )
                 .await;
@@ -317,6 +333,9 @@ impl NostrServerTransport {
         let is_encrypted = session.is_encrypted;
         drop(sessions);
 
+        // CEP-19: Look up the incoming wrap kind for mirroring
+        let mirrored_wrap_kind = self.request_wrap_kinds.read().await.get(event_id).copied().flatten();
+
         let client_pubkey = PublicKey::from_hex(&client_pubkey_hex).map_err(|error| {
             tracing::error!(
                 target: LOG_TARGET,
@@ -346,6 +365,11 @@ impl NostrServerTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 Some(is_encrypted),
+                Self::select_outbound_gift_wrap_kind(
+                    self.config.gift_wrap_mode,
+                    is_encrypted,
+                    mirrored_wrap_kind,
+                ),
             )
             .await
             .map_err(|error| {
@@ -371,6 +395,9 @@ impl NostrServerTransport {
             session.pending_requests.remove(event_id);
         }
         drop(sessions);
+
+        // Clean up wrap-kind tracking and reverse mapping
+        self.request_wrap_kinds.write().await.remove(event_id);
 
         tracing::debug!(
             target: LOG_TARGET,
@@ -405,6 +432,17 @@ impl NostrServerTransport {
             tags.push(Tag::event(event_id));
         }
 
+        // CEP-19: Look up mirrored wrap kind from correlated request
+        let correlated_wrap_kind = correlated_event_id.as_ref().and_then(|event_id| {
+            // Note: we use try_read to avoid deadlock in broadcast paths.
+            // If the lock is contended we fall back to None (uses policy default).
+            self.request_wrap_kinds
+                .try_read()
+                .ok()
+                .and_then(|map| map.get(*event_id).copied())
+                .flatten()
+        });
+
         self.base
             .send_mcp_message(
                 notification,
@@ -412,6 +450,11 @@ impl NostrServerTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 Some(is_encrypted),
+                Self::select_outbound_notification_gift_wrap_kind(
+                    self.config.gift_wrap_mode,
+                    is_encrypted,
+                    correlated_wrap_kind,
+                ),
             )
             .await?;
 
@@ -488,10 +531,12 @@ impl NostrServerTransport {
                 TagKind::Custom(tags::SUPPORT_ENCRYPTION.into()),
                 Vec::<String>::new(),
             ));
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
-                Vec::<String>::new(),
-            ));
+            if self.config.gift_wrap_mode.supports_ephemeral() {
+                tags.push(Tag::custom(
+                    TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+                    Vec::<String>::new(),
+                ));
+            }
         }
 
         let builder = EventBuilder::new(Kind::Custom(SERVER_ANNOUNCEMENT_KIND), content).tags(tags);
@@ -636,117 +681,132 @@ impl NostrServerTransport {
         relay_pool: Arc<dyn RelayPoolTrait>,
         sessions: SessionStore,
         event_routes: ServerEventRouteStore,
+        request_wrap_kinds: Arc<RwLock<HashMap<String, Option<u16>>>>,
         tx: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
         allowed_pubkeys: Vec<String>,
         excluded_capabilities: Vec<CapabilityExclusion>,
         encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     ) {
         let mut notifications = relay_pool.notifications();
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
-                let (content, sender_pubkey, event_id, is_encrypted) = if event.kind
-                    == Kind::Custom(GIFT_WRAP_KIND)
-                    || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
-                {
-                    if encryption_mode == EncryptionMode::Disabled {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            event_id = %event.id.to_hex(),
-                            sender_pubkey = %event.pubkey.to_hex(),
-                            "Received encrypted message but encryption is disabled"
-                        );
-                        continue;
-                    }
-                    {
-                        let guard = match seen_gift_wrap_ids.lock() {
-                            Ok(g) => g,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        if guard.contains(&event.id) {
-                            tracing::debug!(
+                let outer_kind = event.kind.as_u16();
+                let (content, sender_pubkey, event_id, is_encrypted, incoming_gift_wrap_kind) =
+                    if outer_kind == GIFT_WRAP_KIND || outer_kind == EPHEMERAL_GIFT_WRAP_KIND {
+                        let event_kind = outer_kind;
+                        // CEP-19: Enforce gift-wrap-mode policy before decryption.
+                        if !gift_wrap_mode.allows_kind(event_kind) {
+                            tracing::warn!(
                                 target: LOG_TARGET,
                                 event_id = %event.id.to_hex(),
-                                "Skipping duplicate gift-wrap (outer id)"
+                                event_kind = event_kind,
+                                configured_mode = ?gift_wrap_mode,
+                                "Skipping gift wrap due to CEP-19 policy"
                             );
                             continue;
                         }
-                    }
-                    // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                    let signer = match relay_pool.signer().await {
-                        Ok(s) => s,
-                        Err(error) => {
-                            tracing::error!(
+                        if encryption_mode == EncryptionMode::Disabled {
+                            tracing::warn!(
                                 target: LOG_TARGET,
-                                error = %error,
-                                "Failed to get signer"
+                                event_id = %event.id.to_hex(),
+                                sender_pubkey = %event.pubkey.to_hex(),
+                                "Received encrypted message but encryption is disabled"
                             );
                             continue;
                         }
-                    };
-                    match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
-                        Ok(decrypted_json) => {
-                            // The decrypted content is JSON of the inner signed event.
-                            // Use the INNER event's ID for correlation — the client
-                            // registers the inner event ID in its correlation store.
-                            match serde_json::from_str::<Event>(&decrypted_json) {
-                                Ok(inner) => {
-                                    if let Err(e) = inner.verify() {
-                                        tracing::warn!(
-                                            "Inner event signature verification failed: {e}"
+                        {
+                            let guard = match seen_gift_wrap_ids.lock() {
+                                Ok(g) => g,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            if guard.contains(&event.id) {
+                                tracing::debug!(
+                                    target: LOG_TARGET,
+                                    event_id = %event.id.to_hex(),
+                                    "Skipping duplicate gift-wrap (outer id)"
+                                );
+                                continue;
+                            }
+                        }
+                        // Single-layer NIP-44 decrypt (matches JS/TS SDK)
+                        let signer = match relay_pool.signer().await {
+                           Ok(s) => s,
+                            Err(error) => {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    error = %error,
+                                    "Failed to get signer"
+                                );
+                                continue;
+                            }
+                        };
+                        match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
+                            Ok(decrypted_json) => {
+                                // The decrypted content is JSON of the inner signed event.
+                                // Use the INNER event's ID for correlation — the client
+                                // registers the inner event ID in its correlation store.
+                                match serde_json::from_str::<Event>(&decrypted_json) {
+                                    Ok(inner) => {
+                                        if let Err(e) = inner.verify() {
+                                            tracing::warn!(
+                                                "Inner event signature verification failed: {e}"
+                                            );
+                                            continue;
+                                        }
+                                        {
+                                            let mut guard = match seen_gift_wrap_ids.lock() {
+                                                Ok(g) => g,
+                                                Err(poisoned) => poisoned.into_inner(),
+                                            };
+                                            guard.put(event.id, ());
+                                        }
+                                        (
+                                            inner.content,
+                                            inner.pubkey.to_hex(),
+                                            inner.id.to_hex(),
+                                            true,
+                                            Some(event_kind),
+                                        )
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(
+                                            target: LOG_TARGET,
+                                            error = %error,
+                                            "Failed to parse inner event"
                                         );
                                         continue;
                                     }
-                                    {
-                                        let mut guard = match seen_gift_wrap_ids.lock() {
-                                            Ok(g) => g,
-                                            Err(poisoned) => poisoned.into_inner(),
-                                        };
-                                        guard.put(event.id, ());
-                                    }
-                                    (
-                                        inner.content,
-                                        inner.pubkey.to_hex(),
-                                        inner.id.to_hex(),
-                                        true,
-                                    )
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        target: LOG_TARGET,
-                                        error = %error,
-                                        "Failed to parse inner event"
-                                    );
-                                    continue;
                                 }
                             }
+                            Err(error) => {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    error = %error,
+                                    "Failed to decrypt"
+                                );
+                                continue;
+                            }
                         }
-                        Err(error) => {
-                            tracing::error!(
+                    } else {
+                        if encryption_mode == EncryptionMode::Required {
+                            tracing::warn!(
                                 target: LOG_TARGET,
-                                error = %error,
-                                "Failed to decrypt"
+                                sender_pubkey = %event.pubkey.to_hex(),
+                                "Received unencrypted message but encryption is required"
                             );
                             continue;
                         }
-                    }
-                } else {
-                    if encryption_mode == EncryptionMode::Required {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            sender_pubkey = %event.pubkey.to_hex(),
-                            "Received unencrypted message but encryption is required"
-                        );
-                        continue;
-                    }
-                    (
-                        event.content.clone(),
-                        event.pubkey.to_hex(),
-                        event.id.to_hex(),
-                        false,
-                    )
-                };
+                        (
+                            event.content.clone(),
+                            event.pubkey.to_hex(),
+                            event.id.to_hex(),
+                            false,
+                            None,
+                        )
+                    };
 
                 // Parse MCP message
                 let mcp_msg = match validation::validate_and_parse(&content) {
@@ -799,7 +859,13 @@ impl NostrServerTransport {
                 if let JsonRpcMessage::Request(ref req) = mcp_msg {
                     let original_id = req.id.clone();
 
-                    // Extract progress token from _meta if present.
+                    // CEP-19: Track the incoming gift-wrap kind for mirroring
+                    request_wrap_kinds
+                        .write()
+                        .await
+                        .insert(event_id.clone(), incoming_gift_wrap_kind);
+
+                    // Track progress token
                     let progress_token = req
                         .params
                         .as_ref()
@@ -851,9 +917,51 @@ impl NostrServerTransport {
         }
     }
 
+    /// Select the outbound gift-wrap kind for a correlated response.
+    fn select_outbound_gift_wrap_kind(
+        gift_wrap_mode: GiftWrapMode,
+        is_encrypted: bool,
+        mirrored_kind: Option<u16>,
+    ) -> Option<u16> {
+        if !is_encrypted {
+            return None;
+        }
+
+        Some(match gift_wrap_mode {
+            GiftWrapMode::Persistent => GIFT_WRAP_KIND,
+            GiftWrapMode::Ephemeral => EPHEMERAL_GIFT_WRAP_KIND,
+            GiftWrapMode::Optional => match mirrored_kind {
+                Some(kind) if kind == EPHEMERAL_GIFT_WRAP_KIND => EPHEMERAL_GIFT_WRAP_KIND,
+                _ => GIFT_WRAP_KIND,
+            },
+        })
+    }
+
+    /// Select the outbound gift-wrap kind for a notification.
+    fn select_outbound_notification_gift_wrap_kind(
+        gift_wrap_mode: GiftWrapMode,
+        is_encrypted: bool,
+        mirrored_kind: Option<u16>,
+    ) -> Option<u16> {
+        if !is_encrypted {
+            return None;
+        }
+
+        match gift_wrap_mode {
+            GiftWrapMode::Ephemeral => Some(EPHEMERAL_GIFT_WRAP_KIND),
+            GiftWrapMode::Persistent => Some(GIFT_WRAP_KIND),
+            GiftWrapMode::Optional => match mirrored_kind {
+                Some(kind) if kind == EPHEMERAL_GIFT_WRAP_KIND => Some(EPHEMERAL_GIFT_WRAP_KIND),
+                Some(_) => Some(GIFT_WRAP_KIND),
+                None => None,
+            },
+        }
+    }
+
     async fn cleanup_sessions(
         sessions: &SessionStore,
         event_routes: &ServerEventRouteStore,
+        request_wrap_kinds: &RwLock<HashMap<String, Option<u16>>>,
         timeout: Duration,
     ) -> usize {
         let mut sessions_w = sessions.write().await;
@@ -877,8 +985,10 @@ impl NostrServerTransport {
         });
         drop(sessions_w);
 
+        let mut request_wrap_w = request_wrap_kinds.write().await;
         for event_id in &stale_event_ids {
             event_routes.pop(event_id).await;
+            request_wrap_w.remove(event_id);
         }
 
         cleaned
@@ -914,7 +1024,8 @@ mod tests {
     async fn test_cleanup_sessions_removes_expired() {
         let sessions = SessionStore::new();
         let event_routes = ServerEventRouteStore::new();
-
+        let request_wrap_kinds = Arc::new(RwLock::new(HashMap::new()));
+        
         // Insert a session with an old activity time
         let mut session = ClientSession::new(false);
         session
@@ -937,6 +1048,7 @@ mod tests {
         let cleaned = NostrServerTransport::cleanup_sessions(
             &sessions,
             &event_routes,
+            &request_wrap_kinds,
             Duration::from_secs(300),
         )
         .await;
@@ -948,6 +1060,7 @@ mod tests {
         let cleaned = NostrServerTransport::cleanup_sessions(
             &sessions,
             &event_routes,
+            &request_wrap_kinds,
             Duration::from_millis(1),
         )
         .await;
@@ -960,12 +1073,14 @@ mod tests {
     async fn test_cleanup_preserves_active_sessions() {
         let sessions = SessionStore::new();
         let event_routes = ServerEventRouteStore::new();
+        let request_wrap_kinds = Arc::new(RwLock::new(HashMap::new()));
 
         sessions.get_or_create_session("active", false).await;
 
         let cleaned = NostrServerTransport::cleanup_sessions(
             &sessions,
             &event_routes,
+            &request_wrap_kinds,
             Duration::from_secs(300),
         )
         .await;
@@ -1099,12 +1214,14 @@ mod tests {
         assert_eq!(config.encryption_mode, EncryptionMode::Optional);
     }
 
-    // ── Config defaults ─────────────────────────────────────────
+    // ── Config defaults ───────────────────────────────────────────
 
     #[test]
     fn test_config_defaults() {
         let config = NostrServerTransportConfig::default();
         assert_eq!(config.relay_urls, vec!["wss://relay.damus.io".to_string()]);
+        assert_eq!(config.encryption_mode, EncryptionMode::Optional);
+        assert_eq!(config.gift_wrap_mode, GiftWrapMode::Optional);
         assert!(!config.is_announced_server);
         assert!(config.allowed_public_keys.is_empty());
         assert!(config.excluded_capabilities.is_empty());
@@ -1112,5 +1229,104 @@ mod tests {
         assert_eq!(config.session_timeout, Duration::from_secs(300));
         assert!(config.server_info.is_none());
         assert!(config.log_file_path.is_none());
+    }
+
+    // ── CEP-19 outbound gift-wrap kind selection ────────────────
+
+    #[test]
+    fn test_select_outbound_persistent_mode() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Persistent,
+                true,
+                Some(EPHEMERAL_GIFT_WRAP_KIND),
+            ),
+            Some(GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_ephemeral_mode() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Ephemeral,
+                true,
+                None,
+            ),
+            Some(EPHEMERAL_GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_optional_mirrors_ephemeral() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+                Some(EPHEMERAL_GIFT_WRAP_KIND),
+            ),
+            Some(EPHEMERAL_GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_optional_mirrors_persistent() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+                Some(GIFT_WRAP_KIND),
+            ),
+            Some(GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_optional_defaults_to_persistent_when_no_mirror() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+                None,
+            ),
+            Some(GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_unencrypted_returns_none() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Ephemeral,
+                false,
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_select_notification_optional_no_correlation() {
+        // Optional mode with no correlated request → None (use base default)
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_select_notification_ephemeral_mode() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Ephemeral,
+                true,
+                None,
+            ),
+            Some(EPHEMERAL_GIFT_WRAP_KIND)
+        );
     }
 }
