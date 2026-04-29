@@ -91,6 +91,10 @@ pub struct ClientSession {
     pub is_initialized: bool,
     /// Whether the client's messages were encrypted.
     pub is_encrypted: bool,
+    /// Whether common discovery tags have been sent to this client.
+    pub has_sent_common_tags: bool,
+    /// Whether the client has demonstrated support for ephemeral gift wraps.
+    pub supports_ephemeral_gift_wrap: bool,
     /// Last activity timestamp.
     pub last_activity: Instant,
     /// Pending requests: event_id → original request ID.
@@ -105,6 +109,8 @@ impl ClientSession {
         Self {
             is_initialized: false,
             is_encrypted,
+            has_sent_common_tags: false,
+            supports_ephemeral_gift_wrap: false,
             last_activity: Instant::now(),
             pending_requests: HashMap::new(),
             event_to_progress_token: HashMap::new(),

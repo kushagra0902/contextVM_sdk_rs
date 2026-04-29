@@ -74,8 +74,14 @@ impl Default for NostrServerTransportConfig {
 
 /// Server-side Nostr transport — receives MCP requests and sends responses.
 pub struct NostrServerTransport {
+    /// Relay pool for publishing and subscribing.
     base: BaseTransport,
+    /// Configuration for this server transport.
     config: NostrServerTransportConfig,
+    /// Extra common discovery tags to include in server announcements and first responses.
+    extra_common_tags: Vec<Tag>,
+    /// Pricing tags to include in announcements and capability list responses.
+    pricing_tags: Vec<Tag>,
     /// Client sessions.
     sessions: SessionStore,
     /// Reverse lookup: event_id → client route.
@@ -141,6 +147,8 @@ impl NostrServerTransport {
                 is_connected: false,
             },
             config,
+            extra_common_tags: Vec::new(),
+            pricing_tags: Vec::new(),
             sessions: SessionStore::new(),
             event_routes: ServerEventRouteStore::new(),
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
@@ -176,6 +184,8 @@ impl NostrServerTransport {
                 is_connected: false,
             },
             config,
+            extra_common_tags: Vec::new(),
+            pricing_tags: Vec::new(),
             sessions: SessionStore::new(),
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             event_routes: ServerEventRouteStore::new(),
@@ -236,6 +246,8 @@ impl NostrServerTransport {
         let excluded = self.config.excluded_capabilities.clone();
         let encryption_mode = self.config.encryption_mode;
         let gift_wrap_mode = self.config.gift_wrap_mode;
+        let server_info = self.config.server_info.clone();
+        let extra_common_tags = self.extra_common_tags.clone();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
 
         tokio::spawn(async move {
@@ -249,6 +261,8 @@ impl NostrServerTransport {
                 excluded,
                 encryption_mode,
                 gift_wrap_mode,
+                server_info,
+                extra_common_tags,
                 seen_gift_wrap_ids,
             )
             .await;
@@ -334,7 +348,13 @@ impl NostrServerTransport {
         drop(sessions);
 
         // CEP-19: Look up the incoming wrap kind for mirroring
-        let mirrored_wrap_kind = self.request_wrap_kinds.read().await.get(event_id).copied().flatten();
+        let mirrored_wrap_kind = self
+            .request_wrap_kinds
+            .read()
+            .await
+            .get(event_id)
+            .copied()
+            .flatten();
 
         let client_pubkey = PublicKey::from_hex(&client_pubkey_hex).map_err(|error| {
             tracing::error!(
@@ -356,7 +376,23 @@ impl NostrServerTransport {
             Error::Other(error.to_string())
         })?;
 
-        let tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
+        let mut tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
+
+        // Send server info and capabilities on the first response.
+        let mut sent_common_tags = false;
+        let session_snapshot = self.sessions.get_session(&client_pubkey_hex).await;
+        if let Some(snap) = session_snapshot {
+            if !snap.has_sent_common_tags {
+                Self::append_common_response_tags(
+                    &mut tags,
+                    self.config.server_info.as_ref(),
+                    &self.extra_common_tags,
+                    self.config.encryption_mode,
+                    self.config.gift_wrap_mode,
+                );
+                sent_common_tags = true;
+            }
+        }
 
         self.base
             .send_mcp_message(
@@ -382,6 +418,12 @@ impl NostrServerTransport {
                 );
                 error
             })?;
+
+        if sent_common_tags {
+            self.sessions
+                .mark_common_tags_sent(&client_pubkey_hex)
+                .await;
+        }
 
         // Clean up only after successful send
         self.event_routes.pop(event_id).await;
@@ -421,6 +463,7 @@ impl NostrServerTransport {
             .get(client_pubkey_hex)
             .ok_or_else(|| Error::Other(format!("No session for {client_pubkey_hex}")))?;
         let is_encrypted = session.is_encrypted;
+        let supports_ephemeral = session.supports_ephemeral_gift_wrap;
         drop(sessions);
 
         let client_pubkey =
@@ -433,15 +476,16 @@ impl NostrServerTransport {
         }
 
         // CEP-19: Look up mirrored wrap kind from correlated request
-        let correlated_wrap_kind = correlated_event_id.as_ref().and_then(|event_id| {
-            // Note: we use try_read to avoid deadlock in broadcast paths.
-            // If the lock is contended we fall back to None (uses policy default).
+        let correlated_wrap_kind = if let Some(event_id) = correlated_event_id {
             self.request_wrap_kinds
-                .try_read()
-                .ok()
-                .and_then(|map| map.get(*event_id).copied())
+                .read()
+                .await
+                .get(event_id)
+                .copied()
                 .flatten()
-        });
+        } else {
+            None
+        };
 
         self.base
             .send_mcp_message(
@@ -454,6 +498,7 @@ impl NostrServerTransport {
                     self.config.gift_wrap_mode,
                     is_encrypted,
                     correlated_wrap_kind,
+                    supports_ephemeral,
                 ),
             )
             .await?;
@@ -489,6 +534,16 @@ impl NostrServerTransport {
         &mut self,
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>> {
         self.message_rx.take()
+    }
+
+    /// Sets extra discovery tags to include in announcements and first-response discovery replay.
+    pub fn set_announcement_extra_tags(&mut self, tags: Vec<Tag>) {
+        self.extra_common_tags = tags;
+    }
+
+    /// Sets pricing tags to include in announcement/list events and capability list responses.
+    pub fn set_announcement_pricing_tags(&mut self, tags: Vec<Tag>) {
+        self.pricing_tags = tags;
     }
 
     /// Publish server announcement (kind 11316).
@@ -538,6 +593,8 @@ impl NostrServerTransport {
                 ));
             }
         }
+        tags.extend(self.extra_common_tags.iter().cloned());
+        tags.extend(self.pricing_tags.iter().cloned());
 
         let builder = EventBuilder::new(Kind::Custom(SERVER_ANNOUNCEMENT_KIND), content).tags(tags);
 
@@ -550,7 +607,8 @@ impl NostrServerTransport {
         let builder = EventBuilder::new(
             Kind::Custom(TOOLS_LIST_KIND),
             serde_json::to_string(&content)?,
-        );
+        )
+        .tags(self.pricing_tags.iter().cloned());
         self.base.relay_pool.publish(builder).await
     }
 
@@ -560,7 +618,8 @@ impl NostrServerTransport {
         let builder = EventBuilder::new(
             Kind::Custom(RESOURCES_LIST_KIND),
             serde_json::to_string(&content)?,
-        );
+        )
+        .tags(self.pricing_tags.iter().cloned());
         self.base.relay_pool.publish(builder).await
     }
 
@@ -570,7 +629,8 @@ impl NostrServerTransport {
         let builder = EventBuilder::new(
             Kind::Custom(PROMPTS_LIST_KIND),
             serde_json::to_string(&content)?,
-        );
+        )
+        .tags(self.pricing_tags.iter().cloned());
         self.base.relay_pool.publish(builder).await
     }
 
@@ -583,7 +643,8 @@ impl NostrServerTransport {
         let builder = EventBuilder::new(
             Kind::Custom(RESOURCETEMPLATES_LIST_KIND),
             serde_json::to_string(&content)?,
-        );
+        )
+        .tags(self.pricing_tags.iter().cloned());
         self.base.relay_pool.publish(builder).await
     }
 
@@ -676,6 +737,86 @@ impl NostrServerTransport {
         })
     }
 
+    fn server_info_tags(server_info: Option<&ServerInfo>) -> Vec<Tag> {
+        let mut tags = Vec::new();
+        let Some(info) = server_info else {
+            return tags;
+        };
+
+        if let Some(ref name) = info.name {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::NAME.into()),
+                vec![name.clone()],
+            ));
+        }
+        if let Some(ref about) = info.about {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::ABOUT.into()),
+                vec![about.clone()],
+            ));
+        }
+        if let Some(ref website) = info.website {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::WEBSITE.into()),
+                vec![website.clone()],
+            ));
+        }
+        if let Some(ref picture) = info.picture {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::PICTURE.into()),
+                vec![picture.clone()],
+            ));
+        }
+
+        tags
+    }
+
+    fn append_transport_capability_tags(
+        tags: &mut Vec<Tag>,
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+    ) {
+        if encryption_mode == EncryptionMode::Disabled {
+            return;
+        }
+
+        tags.push(Tag::custom(
+            TagKind::Custom(crate::core::constants::tags::SUPPORT_ENCRYPTION.into()),
+            Vec::<String>::new(),
+        ));
+
+        if gift_wrap_mode.supports_ephemeral() {
+            tags.push(Tag::custom(
+                TagKind::Custom(crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+                Vec::<String>::new(),
+            ));
+        }
+    }
+
+    fn append_common_response_tags(
+        tags: &mut Vec<Tag>,
+        server_info: Option<&ServerInfo>,
+        extra_common_tags: &[Tag],
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+    ) {
+        tags.extend(Self::server_info_tags(server_info));
+        Self::append_transport_capability_tags(tags, encryption_mode, gift_wrap_mode);
+        tags.extend(extra_common_tags.iter().cloned());
+    }
+
+    fn unauthorized_error_response(request_id: &serde_json::Value) -> JsonRpcMessage {
+        JsonRpcMessage::ErrorResponse(crate::JsonRpcErrorResponse {
+            jsonrpc: "2.0".to_string(),
+            id: request_id.clone(),
+            error: crate::JsonRpcError {
+                code: -32000,
+                message: "Unauthorized".to_string(),
+                data: None,
+            },
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn event_loop(
         relay_pool: Arc<dyn RelayPoolTrait>,
@@ -687,6 +828,8 @@ impl NostrServerTransport {
         excluded_capabilities: Vec<CapabilityExclusion>,
         encryption_mode: EncryptionMode,
         gift_wrap_mode: GiftWrapMode,
+        server_info: Option<ServerInfo>,
+        extra_common_tags: Vec<Tag>,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     ) {
         let mut notifications = relay_pool.notifications();
@@ -733,7 +876,7 @@ impl NostrServerTransport {
                         }
                         // Single-layer NIP-44 decrypt (matches JS/TS SDK)
                         let signer = match relay_pool.signer().await {
-                           Ok(s) => s,
+                            Ok(s) => s,
                             Err(error) => {
                                 tracing::error!(
                                     target: LOG_TARGET,
@@ -843,6 +986,70 @@ impl NostrServerTransport {
                             method = method,
                             "Unauthorized request"
                         );
+                        if let JsonRpcMessage::Request(ref request) = mcp_msg {
+                            if let Ok(client_pubkey) = PublicKey::from_hex(&sender_pubkey) {
+                                let mut tags = BaseTransport::create_response_tags(
+                                    &client_pubkey,
+                                    &EventId::from_hex(&event_id).unwrap_or(event.id),
+                                );
+                                let should_mark_common_tags =
+                                    match sessions.get_session(&sender_pubkey).await {
+                                        Some(snap) => {
+                                            if snap.has_sent_common_tags {
+                                                false
+                                            } else {
+                                                Self::append_common_response_tags(
+                                                    &mut tags,
+                                                    server_info.as_ref(),
+                                                    &extra_common_tags,
+                                                    encryption_mode,
+                                                    gift_wrap_mode,
+                                                );
+                                                true
+                                            }
+                                        }
+                                        None => {
+                                            Self::append_common_response_tags(
+                                                &mut tags,
+                                                server_info.as_ref(),
+                                                &extra_common_tags,
+                                                encryption_mode,
+                                                gift_wrap_mode,
+                                            );
+                                            false
+                                        }
+                                    };
+                                let transport = BaseTransport {
+                                    relay_pool: relay_pool.clone(),
+                                    encryption_mode,
+                                    is_connected: true,
+                                };
+                                if let Err(error) = transport
+                                    .send_mcp_message(
+                                        &Self::unauthorized_error_response(&request.id),
+                                        &client_pubkey,
+                                        CTXVM_MESSAGES_KIND,
+                                        std::mem::take(&mut tags),
+                                        Some(is_encrypted),
+                                        Self::select_outbound_gift_wrap_kind(
+                                            gift_wrap_mode,
+                                            is_encrypted,
+                                            incoming_gift_wrap_kind,
+                                        ),
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        target: LOG_TARGET,
+                                        error = %error,
+                                        client_pubkey = %sender_pubkey,
+                                        "Failed to send unauthorized response"
+                                    );
+                                } else if should_mark_common_tags {
+                                    sessions.mark_common_tags_sent(&sender_pubkey).await;
+                                }
+                            }
+                        }
                         continue;
                     }
                 }
@@ -854,6 +1061,8 @@ impl NostrServerTransport {
                     .or_insert_with(|| ClientSession::new(is_encrypted));
                 session.update_activity();
                 session.is_encrypted = is_encrypted;
+                session.supports_ephemeral_gift_wrap |=
+                    incoming_gift_wrap_kind == Some(EPHEMERAL_GIFT_WRAP_KIND);
 
                 // Track request for correlation
                 if let JsonRpcMessage::Request(ref req) = mcp_msg {
@@ -942,6 +1151,7 @@ impl NostrServerTransport {
         gift_wrap_mode: GiftWrapMode,
         is_encrypted: bool,
         mirrored_kind: Option<u16>,
+        supports_ephemeral: bool,
     ) -> Option<u16> {
         if !is_encrypted {
             return None;
@@ -953,7 +1163,8 @@ impl NostrServerTransport {
             GiftWrapMode::Optional => match mirrored_kind {
                 Some(kind) if kind == EPHEMERAL_GIFT_WRAP_KIND => Some(EPHEMERAL_GIFT_WRAP_KIND),
                 Some(_) => Some(GIFT_WRAP_KIND),
-                None => None,
+                None if supports_ephemeral => Some(EPHEMERAL_GIFT_WRAP_KIND),
+                None => Some(GIFT_WRAP_KIND),
             },
         }
     }
@@ -1025,7 +1236,7 @@ mod tests {
         let sessions = SessionStore::new();
         let event_routes = ServerEventRouteStore::new();
         let request_wrap_kinds = Arc::new(RwLock::new(HashMap::new()));
-        
+
         // Insert a session with an old activity time
         let mut session = ClientSession::new(false);
         session
@@ -1307,14 +1518,24 @@ mod tests {
 
     #[test]
     fn test_select_notification_optional_no_correlation() {
-        // Optional mode with no correlated request → None (use base default)
+        // Optional mode with no correlated request uses known peer support.
         assert_eq!(
             NostrServerTransport::select_outbound_notification_gift_wrap_kind(
                 GiftWrapMode::Optional,
                 true,
                 None,
+                false,
             ),
-            None
+            Some(GIFT_WRAP_KIND)
+        );
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+                None,
+                true,
+            ),
+            Some(EPHEMERAL_GIFT_WRAP_KIND)
         );
     }
 
@@ -1325,8 +1546,74 @@ mod tests {
                 GiftWrapMode::Ephemeral,
                 true,
                 None,
+                false,
             ),
             Some(EPHEMERAL_GIFT_WRAP_KIND)
         );
+    }
+
+    #[test]
+    fn test_append_transport_capability_tags_respects_gift_wrap_mode() {
+        let mut tags = Vec::new();
+        NostrServerTransport::append_transport_capability_tags(
+            &mut tags,
+            EncryptionMode::Optional,
+            GiftWrapMode::Persistent,
+        );
+        let rendered: Vec<Vec<String>> = tags.iter().cloned().map(|t| t.to_vec()).collect();
+        assert!(rendered
+            .iter()
+            .any(|t| t[0] == crate::core::constants::tags::SUPPORT_ENCRYPTION));
+        assert!(!rendered
+            .iter()
+            .any(|t| { t[0] == crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL }));
+
+        let mut tags = Vec::new();
+        NostrServerTransport::append_transport_capability_tags(
+            &mut tags,
+            EncryptionMode::Optional,
+            GiftWrapMode::Optional,
+        );
+        let rendered: Vec<Vec<String>> = tags.iter().cloned().map(|t| t.to_vec()).collect();
+        assert!(rendered
+            .iter()
+            .any(|t| { t[0] == crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL }));
+    }
+
+    #[test]
+    fn test_common_response_tags_include_server_info_and_transport_capabilities() {
+        let mut tags = Vec::new();
+        NostrServerTransport::append_common_response_tags(
+            &mut tags,
+            Some(&ServerInfo {
+                name: Some("Demo".to_string()),
+                ..Default::default()
+            }),
+            &[Tag::custom(
+                TagKind::Custom("x-demo".into()),
+                Vec::<String>::new(),
+            )],
+            EncryptionMode::Optional,
+            GiftWrapMode::Optional,
+        );
+        let rendered: Vec<Vec<String>> = tags.iter().cloned().map(|tag| tag.to_vec()).collect();
+        assert!(rendered
+            .iter()
+            .any(|tag| tag[0] == crate::core::constants::tags::NAME));
+        assert!(rendered
+            .iter()
+            .any(|tag| tag[0] == crate::core::constants::tags::SUPPORT_ENCRYPTION));
+        assert!(rendered.iter().any(|tag| tag[0] == "x-demo"));
+    }
+
+    #[test]
+    fn test_unauthorized_error_response_shape() {
+        let response = NostrServerTransport::unauthorized_error_response(&serde_json::json!(1));
+        let JsonRpcMessage::ErrorResponse(response) = response else {
+            panic!("expected JSON-RPC error response");
+        };
+        assert_eq!(response.id, serde_json::json!(1));
+        assert_eq!(response.error.code, -32000);
+        assert_eq!(response.error.message, "Unauthorized");
     }
 }

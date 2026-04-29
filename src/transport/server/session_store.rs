@@ -45,6 +45,8 @@ impl SessionStore {
         sessions.get(client_pubkey).map(|s| SessionSnapshot {
             is_initialized: s.is_initialized,
             is_encrypted: s.is_encrypted,
+            has_sent_common_tags: s.has_sent_common_tags,
+            supports_ephemeral_gift_wrap: s.supports_ephemeral_gift_wrap,
         })
     }
 
@@ -53,6 +55,17 @@ impl SessionStore {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(client_pubkey) {
             session.is_initialized = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark that common tags have been sent for this session.
+    pub async fn mark_common_tags_sent(&self, client_pubkey: &str) -> bool {
+        let mut sessions = self.sessions.write().await;
+        if let Some(session) = sessions.get_mut(client_pubkey) {
+            session.has_sent_common_tags = true;
             true
         } else {
             false
@@ -85,6 +98,8 @@ impl SessionStore {
                     SessionSnapshot {
                         is_initialized: s.is_initialized,
                         is_encrypted: s.is_encrypted,
+                        has_sent_common_tags: s.has_sent_common_tags,
+                        supports_ephemeral_gift_wrap: s.supports_ephemeral_gift_wrap,
                     },
                 )
             })
@@ -112,6 +127,8 @@ impl SessionStore {
 pub struct SessionSnapshot {
     pub is_initialized: bool,
     pub is_encrypted: bool,
+    pub has_sent_common_tags: bool,
+    pub supports_ephemeral_gift_wrap: bool,
 }
 
 #[cfg(test)]
